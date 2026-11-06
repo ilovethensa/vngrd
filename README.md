@@ -34,6 +34,75 @@ UEFI firmware
                       └─ encrypted /var and /home
 ```
 
+## Partition layout
+
+The image ships 5 partitions; the first boot provisions the root. The two slot B
+partitions are placeholder sizes until the first update writes into them.
+
+**Before provisioning** (straight from the image, `vngrd_0.1.raw`):
+
+| # | Label | Type | Size | Contents |
+|---|---|---|---|---|
+| 1 | vngrd-esp | ESP | 320 MB | systemd-boot, UKI in `EFI/Linux/`, pcrlock credentials |
+| 2 | vngrd-usr_0.1 | usr | 192 MB | slot A `/usr` (erofs) |
+| 3 | vngrd-usr_0.1_verity | usr-verity | 2 MB | dm-verity hash tree for slot A |
+| 4 | _empty | usr | 192 MB | slot B, empty; sysupdate writes the next version here |
+| 5 | _empty | usr-verity | 2 MB | slot B hash tree, empty |
+
+**After provisioning** (first boot):
+
+| # | Label | Type | Size | Contents |
+|---|---|---|---|---|
+| 1 | vngrd-esp | ESP | 320 MB | unchanged; its contents are now pinned by the ESP guard |
+| 2 | vngrd-usr_0.1 | usr | 192 MB | slot A `/usr` (erofs) |
+| 3 | vngrd-usr_0.1_verity | usr-verity | 2 MB | dm-verity hash tree for slot A |
+| 4 | _empty | usr | 192 MB | still empty; filled by the first sysupdate |
+| 5 | _empty | usr-verity | 2 MB | still empty |
+| 6 | vngrd-root | root, LUKS2 | remaining space (1 GB minimum) | writable root: `/etc` is tmpfs, `/var` and `/home` persistent |
+
+sysupdate writes the next version into slot B (relabelled with the new version),
+and slots alternate with every update after that. The root partition is shared
+by both slots and is created exactly once, on the first boot, by
+`systemd-repart` running from the initrd.
+
+## Installation
+
+1. Write the image to the target disk:
+   ```
+   dd if=vngrd_0.1.raw of=/dev/sdX bs=4M status=progress
+   sync
+   ```
+   `vngrd_0.1.raw` is a complete GPT disk image, not a filesystem dump, so dd it
+   to a whole disk, not to a partition. Verify the artifact against the
+   published SHA256SUMS first.
+
+2. Enrol the Secure Boot keys from trusted media with the machine in setup
+   mode. Production images do not carry the enrolment keys on their own ESP, so
+   nothing does this for you; the signed variable updates are published with
+   the image under `output/image/secureboot/` (see `vngrd-image/README.md`,
+   "Secure Boot key lifecycle"):
+   ```
+   efi-updatevar -f PK.auth PK
+   efi-updatevar -f KEK.auth KEK
+   efi-updatevar -f db.auth db
+   efi-readvar -v db
+   ```
+   Without enforced Secure Boot the first boot refuses to provision
+   (`systemd-repart` is gated on `ConditionSecurity=uefi-secureboot`): the
+   system will not seal the root's key to a platform that is not attesting to
+   anything.
+
+3. Boot from the disk. The first-boot console asks you to choose a root
+   recovery passphrase and a TPM2 PIN (each twice). The recovery passphrase is
+   the fallback when the TPM cannot unseal — a changed firmware or dbx update —
+   and it is never printed again, so record it somewhere safe. After the
+   prompts, provisioning completes on its own: the TPM NV checks are frozen,
+   the root is created and unlocked, and the login prompt appears.
+
+4. That is the whole install. Updates are `systemd-sysupdate` runs that fill
+   slot B; the rollback floor moves up in TPM NV once a slot reaches
+   `boot-complete`, and a failed update wastes nothing but slot B.
+
 ## Licensing
 
 vngrd is licensed under the GNU General Public License, version 3 (see
