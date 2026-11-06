@@ -1,0 +1,57 @@
+#!/bin/sh -e
+# libgcc_s.so.1 -- GCC's shared runtime, which the image needs for the unwinder.
+#
+# WHY IT IS A PACKAGE RATHER THAN A FLAG. Only three binaries in the whole image
+# reference it, and all three are fish: fish and fish_key_reader are C++ and need
+# _Unwind_* for exception handling, and fish_indent is Rust, whose default
+# panic=unwind on x86_64-unknown-linux-gnu needs the same. Nothing else -- not
+# systemd, e2fsprogs, curl, openssl, dbus-broker -- emits a DT_NEEDED on it,
+# because plain C links no unwinder.
+#
+# -static-libgcc was tried and does not work, which is worth recording because it
+# is the obvious first answer. It is a DRIVER flag: it substitutes the driver's
+# own implicit -lgcc_s with the static archive. It cannot rewrite an explicit
+# -lgcc_s, and the Rust half's is explicit by construction -- the prebuilt libstd
+# carries #[link(name = "gcc_s")] in its unwinding glue, inside a blob the build
+# never compiles, so no driver flag reaches it. The only Rust-side static option,
+# -C target-feature=+crt-static, links glibc statically too, which contradicts
+# the merged-/usr interpreter the whole tree is built around. Measured: with
+# -static-libgcc on both the cmake linker vars and RUSTFLAGS, all three binaries
+# still carried DT_NEEDED libgcc_s.so.1.
+#
+# So it is shipped. Same shape as the ld-linux shim every other package does:
+# a file taken from the toolchain, installed into $dest, with the provenance
+# stated -- it is the Debian-toolchain build matched to the clang that compiled
+# this tree, so it is the artifact the binaries were actually linked against.
+dest="$1"
+# No configure/make: this is a copy, not a build. cd is here so the script fails
+# loudly if SRC_DIR handling in build-pkg.sh ever changes underneath us.
+cd /packages/libgcc || exit 1
+
+SRC=/usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+if [ ! -e "$SRC" ]; then
+    echo "libgcc: $SRC not present in the builder image." >&2
+    echo "  The builder Dockerfile is where a toolchain comes from; check that" >&2
+    echo "  gcc/gcc-12-libgcc is still in it." >&2
+    exit 1
+fi
+
+mkdir -p "$dest/usr/lib"
+install -m 0755 "$SRC" "$dest/usr/lib/libgcc_s.so.1"
+
+if [ ! -e "$dest/usr/lib/libgcc_s.so.1" ]; then
+    echo "libgcc: libgcc_s.so.1 missing after install" >&2
+    exit 1
+fi
+
+# Prove it is the shared object and not a linker script or a symlink into the
+# host: verify.sh resolves DT_NEEDED entries by following the file, so a symlink
+# out of the image would satisfy this assertion and then fail the next package.
+if [ -L "$dest/usr/lib/libgcc_s.so.1" ]; then
+    echo "libgcc: installed a symlink, not a file" >&2
+    exit 1
+fi
+if ! readelf -h "$dest/usr/lib/libgcc_s.so.1" 2>/dev/null | grep -q 'DYN'; then
+    echo "libgcc: libgcc_s.so.1 is not a shared object (no DYN header)" >&2
+    exit 1
+fi

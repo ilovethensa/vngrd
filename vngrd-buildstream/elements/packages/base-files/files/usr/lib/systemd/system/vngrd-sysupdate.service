@@ -1,0 +1,29 @@
+[Unit]
+Description=Install a new OS version into the spare A/B slot
+Documentation=man:sysupdate.d(5) man:systemd-sysupdate(8) https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/
+# systemd-sysupdate has no lock of its own: two concurrent runs pick the same
+# empty slot by GPT label. systemd-sysupdated does not help (the CLI holds no
+# D-Bus connection), so the lock wraps the whole invocation below.
+#
+# This unit is not enabled anywhere and has no [Install]. Run updates through it,
+# or take the lock yourself. The stock systemd-sysupdate.service is not enabled
+# either, and its [Install] also pulls in the timer.
+ConditionPathIsDirectory=/var/lib/vngrd/update
+
+[Service]
+Type=oneshot
+# Not RemainAfterExit: a unit that stays active refuses a second start. This one
+# is idempotent without it (sysupdate exits 0 with "No update needed.").
+#
+# ExecStartPre=, not ExecCondition=: an ExecCondition= failure is a silent skip,
+# and a missing IMAGE_VERSION must fail loudly -- on update, sysupdate otherwise
+# discards ProtectVersion= and MinVersion= with only a warning.
+# /etc/os-release is deliberate: a missing symlink is itself the fault, while
+# /usr/lib/os-release would report success.
+ExecStartPre=/usr/bin/pcre2grep --quiet '^IMAGE_VERSION=.+' /etc/os-release
+# flock <file> <cmd...> rather than -c, which would exec /bin/sh (there is no
+# /bin). -w takes seconds. -E 75 keeps lock timeouts distinct from sysupdate's
+# own codes. The lock file is under /var/lib so it is not removed between runs.
+ExecStart=/usr/bin/flock -w 1500 -E 75 /var/lib/vngrd/sysupdate.lock /usr/lib/systemd/systemd-sysupdate update
+# Two partition images and a UKI; up to 1500s of this can be lock wait.
+TimeoutStartSec=30min

@@ -1,0 +1,7 @@
+# Repository-local fallback state when XDG dirs are not writable (sandbox/CI).
+/.state/
+/.cache/
+__pycache__/
+*.pyc
+/results/
+*.junit.xml

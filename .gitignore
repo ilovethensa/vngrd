@@ -1,0 +1,23 @@
+# Shared handoff between vngrd-{rootfs,kernel,image}
+/output/
+
+# Build caches and generated trees at the root. Anchored so they do not
+# swallow same-named source directories inside the components.
+/rootfs/
+/images/
+/toolchain/
+# `out` is a symlink to vngrd-rootfs/out, and a trailing-slash pattern only
+# matches directories, so this has to be the bare name.
+/out
+/work/
+/sources/
+/bin/
+/cache/
+/.cache/
+*.img
+*.squashfs
+*.erofs
+*.iso
+__pycache__/
+
+.staging-root/

@@ -1,0 +1,7 @@
+out/
+work/
+cache/
+.cache/
+*.tar.gz
+*.tar.xz
+__pycache__/

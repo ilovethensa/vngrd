@@ -1,0 +1,44 @@
+[Unit]
+# Freeze the fixate digest, the GPT identity, the ESP identity and the initial
+# rollback floor into TPM NV, once.
+#
+# All four values exist only on the boot that creates the root volume. repart
+# computes the volume-key digest while it still holds the key and writes
+# fixate-volume-key= into /run/vngrd/repart-crypttab; later boots rewrite that
+# file without the option. An empty register on a boot without the marker is a
+# deleted register, so the freeze fails instead of re-arming the control. The
+# guard refuses the next boot.
+DefaultDependencies=no
+After=sysroot.mount sysusr-usr.mount
+Before=vngrd-leave-initrd.service
+Conflicts=shutdown.target
+# No FailureAction: a failed freeze cannot be fixed by rebooting, and a reboot
+# loop would turn a provisioning fault into a machine that never boots. The next
+# boot's guard refuses, which is the loud half.
+ConditionPathExists=/etc/initrd-release
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The initrd has no journal, so the console is the only trace.
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell: /usr/bin/sh is fish. The program reads the generated crypttab and
+# treats "not provisioned yet" as exit 0.
+ExecStart=/usr/lib/vngrd/vngrd-fixate-nvwrite --crypttab=/run/vngrd/repart-crypttab
+
+# GPT identity, frozen in the same one-shot window. Idempotent against the TPM,
+# so later boots are no-ops. The fixate write runs first: the layout must have
+# been acceptable before it is worth freezing.
+ExecStart=/usr/lib/vngrd/vngrd-gpt-freeze
+
+# ESP identity, last: the table and the volume are checked before the loader on
+# them. Freezing here captures the shipped tree, before host-side writes (pcrlock
+# credentials, sd-boot random seed) can touch the ESP.
+ExecStart=/usr/lib/vngrd/vngrd-esp-freeze
+
+# Initial rollback floor. --create is honoured only with fixate-volume-key=, so
+# DefineSpace happens only on this boot; later boots only read the counter.
+# The version comes from the verified /usr the kernel is about to run.
+ExecStart=/usr/lib/vngrd/vngrd-rollback-commit --create /sysusr/usr/lib/os-release

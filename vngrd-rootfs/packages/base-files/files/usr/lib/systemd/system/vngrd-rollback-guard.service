@@ -1,0 +1,35 @@
+[Unit]
+# Refuse to boot an image older than the highest this machine has run.
+#
+# The value compared is IMAGE_VERSION from the verified /usr, and the check runs
+# before the root key is released. An absent counter passes only while the disk
+# is unprovisioned or on the provisioning boot; with a root partition and no
+# fixate-volume-key= marker it is a refusal, because the register was deleted.
+# That makes host-root undefine a denial of service, not a downgrade. Once the
+# register exists, unreadable, unparseable and lower values are all refusals.
+#
+# After systemd-repart.service: repart writes the root partition before it
+# appends fixate-volume-key= to /run/vngrd/repart-crypttab, and a guard that ran
+# between those moments would mistake a healthy first boot for a deleted register.
+DefaultDependencies=no
+After=sysusr-usr.mount systemd-repart.service
+Before=sysroot.mount
+# The instance name is escaped by cryptsetup-generator.
+Before=systemd-cryptsetup@vngrd\x2droot.service
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+# A reboot loop is loud, runs no attacker-selected code, and does not drop into
+# the initrd's emergency shell (which has no shell anyway).
+FailureAction=reboot-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The initrd has no journal, so the console half is the only trace a refusal leaves.
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell: /usr/bin/sh is fish in this image. The "no floor yet" case is an
+# early return in the program rather than a Condition=, which would skip the
+# unit and let the boot proceed.
+ExecStart=/usr/lib/vngrd/vngrd-rollback-guard /sysusr/usr/lib/os-release

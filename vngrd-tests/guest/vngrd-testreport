@@ -1,0 +1,93 @@
+#!/bin/sh
+# vngrd-testreport — emit structured test events on the system console.
+#
+# This is the guest half of the test contract. It is the only thing in the image
+# that the suite parses, and it emits machine-readable lines:
+#
+#     VNGRO 1 <event> [key=value ...]
+#
+#   vngrd-testreport event boot.usr-mounted fs=erofs
+#   vngrd-testreport assert id=etc-is-tmpfs ok=1 detail=tmpfs
+#   vngrd-testreport checks /usr/share/vngrd/tests/checks.tsv
+#
+# Why this exists: the previous harness grepped the console for prose such as
+# "Mounted /sysusr/usr.", which welds the suite to systemd's message wording and
+# to the order those messages happen to print in. An event is a name the suite
+# chose, emitted at a point the image chose, and it fails loudly instead of
+# disappearing.
+#
+# It must stay inert unless the boot asked for it: see `vngrd.test=1` in
+# docs/boot-instrumentation.md. Nothing here runs on a production boot.
+
+CONSOLE=${VNGRD_TEST_CONSOLE:-/dev/console}
+VERSION=1
+
+emit() {
+    _line="VNGRO $VERSION $*"
+    # Append, never truncate: the console is a stream, and a file target (used by
+    # the payload's own tests) must accumulate lines.
+    printf '%s\n' "$_line" >>"$CONSOLE" 2>/dev/null || printf '%s\n' "$_line" >&2
+}
+
+# Fields are `key=value` and the host splits on whitespace, so a value may not
+# contain one. Normalise rather than let a stray space corrupt a whole line.
+field() {
+    printf '%s' "$1" | tr ' \t\n' '___'
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: vngrd-testreport event <name> [key=value ...]
+       vngrd-testreport assert id=<id> ok=<0|1> [detail=<token>]
+       vngrd-testreport checks <file>
+EOF
+    exit 2
+}
+
+run_checks() {
+    _file="$1"
+    [ -r "$_file" ] || {
+        emit assert id=checks.file ok=0 detail=missing
+        return 1
+    }
+    # TSV: id <TAB> mode <TAB> expected <TAB> command
+    while IFS="$(printf '\t')" read -r _id _mode _expected _command; do
+        case "$_id" in
+            ''|'#'*) continue ;;
+        esac
+        _out=$(sh -c "$_command" 2>&1)
+        _rc=$?
+        _ok=0
+        case "$_mode" in
+            eq)     [ "$_out" = "$_expected" ] && _ok=1 ;;
+            has)    case "$_out" in *"$_expected"*) _ok=1 ;; esac ;;
+            rc)     [ "$_rc" = "$_expected" ] && _ok=1 ;;
+            absent) [ ! -e "$_expected" ] && _ok=1 ;;
+            *)      _out="unknown mode $_mode" ;;
+        esac
+        _detail=$(field "${_out:-rc=$_rc}")
+        emit assert id="$_id" ok="$_ok" detail="$_detail"
+    done <"$_file"
+    emit boot.self-test-complete
+}
+
+[ $# -ge 1 ] || usage
+_command=$1
+shift
+case "$_command" in
+    event)
+        [ $# -ge 1 ] || usage
+        emit "$@"
+        ;;
+    assert)
+        [ $# -ge 3 ] || usage
+        emit assert "$@"
+        ;;
+    checks)
+        [ $# -ge 1 ] || usage
+        run_checks "$1"
+        ;;
+    *)
+        usage
+        ;;
+esac

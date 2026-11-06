@@ -1,0 +1,56 @@
+#!/bin/sh -e
+dest="$1"
+cd fish-4.9.0
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+mkdir -p build
+cd build
+cmake .. \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_SYSCONFDIR=/etc \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_C_FLAGS="--sysroot=/out -O2 -pipe -march=x86-64" \
+    -DCMAKE_CXX_FLAGS="--sysroot=/out -O2 -pipe -march=x86-64" \
+    -DCMAKE_EXE_LINKER_FLAGS="--sysroot=/out -L/out/usr/lib -L/usr/lib/x86_64-linux-gnu -Wl,--dynamic-linker=/usr/lib/ld-linux-x86-64.so.2" \
+    -DCMAKE_SHARED_LINKER_FLAGS="--sysroot=/out -L/out/usr/lib -L/usr/lib/x86_64-linux-gnu -Wl,--dynamic-linker=/usr/lib/ld-linux-x86-64.so.2" \
+    -DFISH_USE_SYSTEM_PCRE2=ON
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Hermetic: no /etc, /bin or /usr/etc in vendor payload (cmake's sysconfdir
+# default is prefix-relative, i.e. /usr/etc). Shells and root user via
+# base-files sysusers/factory (00-vngrd-root.conf + factory/etc/shells).
+rm -rf "$dest/etc" "$dest/bin" "$dest/usr/etc" 2>/dev/null || true
+mkdir -p "$dest/usr/bin"
+
+# The C++ and Rust halves here both need libgcc_s.so.1 for the unwinder, and
+# NOTHING links it statically -- see the note in config/kiss.conf and the
+# libgcc package's own build. This is asserted only for presence, not for the
+# absence of the dependency, because the absence is not achievable: see
+# packages/libgcc/build for why.
+for t in fish fish_indent fish_key_reader; do
+    if [ ! -x "$dest/usr/bin/$t" ]; then
+        echo "fish: $t missing from the install" >&2
+        exit 1
+    fi
+done
+
+# /usr/bin/sh is fish. There is no POSIX shell anywhere in the image -- the
+# initrd has none at all, and several packages carry vendored shell scripts whose
+# shebangs are deliberately left unrewritten for that reason (see
+# packages/libpam/build). The symlink is not optional: sysusers.d/00-vngrd-root.conf
+# gives root the shell /usr/bin/sh and factory/etc/shells lists it, so without it
+# login(1) authenticates the user, execs a path that does not exist, and drops
+# straight back to the login prompt -- the machine has no way to give anyone a
+# shell at all.
+ln -sfn fish "$dest/usr/bin/sh"
+[ -L "$dest/usr/bin/sh" ] || { echo "fish: /usr/bin/sh is not a symlink" >&2; exit 1; }
+[ "$(readlink "$dest/usr/bin/sh")" = fish ] || {
+    echo "fish: /usr/bin/sh must point at fish" >&2; exit 1; }

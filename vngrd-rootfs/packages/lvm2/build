@@ -1,0 +1,47 @@
+#!/bin/sh -e
+dest="$1"
+cd LVM2.2.03.28
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# Only build device-mapper, not full lvm (use gcc, clang lld version script fails)
+CC=gcc CXX=g++ ./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --with-usrlibdir=/usr/lib \
+    --enable-device-mapper \
+    --disable-selinux \
+    --disable-udev \
+    --disable-lvm2app \
+    --disable-cmdlib \
+    --disable-dmeventd \
+    --disable-lvmetad \
+    --disable-lvmpolld \
+    --with-thin=internal \
+    --enable-thin_check_needs_check \
+    --enable-cache_check_needs_check
+
+# Use bfd linker for lvm2 (lld version script issue) - only libdm
+make CC=gcc LD=ld.bfd LDFLAGS="-Wl,-O1 -Wl,--as-needed --sysroot=/out -L/out/usr/lib -L/usr/lib/x86_64-linux-gnu -Wl,--dynamic-linker=/usr/lib/ld-linux-x86-64.so.2" -j${JOBS:-$(nproc)} libdm.device-mapper
+make DESTDIR="$dest" CC=gcc LD=ld.bfd LDFLAGS="-Wl,-O1 -Wl,--as-needed --sysroot=/out -L/out/usr/lib -L/usr/lib/x86_64-linux-gnu -Wl,--dynamic-linker=/usr/lib/ld-linux-x86-64.so.2" -C libdm install
+make DESTDIR="$dest" -C libdm install_include 2>/dev/null || true
+# Ensure pkgconfig is installed (libdevmapper.pc + devmapper.pc compat)
+if [ -f libdm/libdevmapper.pc ]; then
+    mkdir -p "$dest/usr/lib/pkgconfig"
+    cp -a libdm/libdevmapper.pc "$dest/usr/lib/pkgconfig/" 2>/dev/null || true
+    # libcryptsetup Requires.private: devmapper (not libdevmapper) — provide compat link
+    ln -sf libdevmapper.pc "$dest/usr/lib/pkgconfig/devmapper.pc" 2>/dev/null || true
+fi
+
+# Ensure no sbin
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin" 2>/dev/null || true
+fi

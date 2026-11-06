@@ -1,0 +1,16 @@
+[Unit]
+Description=vngrd initrd milestone: root unsealed
+ConditionKernelCommandLine=vngrd.test=1
+DefaultDependencies=no
+After=initrd-root-fs.target
+Before=initrd-switch-root.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/vngrd-tests/vngrd-testreport event boot.root-unsealed
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=initrd-switch-root.target

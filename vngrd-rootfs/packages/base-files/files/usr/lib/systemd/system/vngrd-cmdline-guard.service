@@ -1,0 +1,33 @@
+[Unit]
+# Confirm that the kernel command line the machine booted is the one the signed
+# UKI carries, before anything acts on it.
+#
+# usrhash= selects the /usr verity pair, and the last occurrence wins.
+# systemd-stub appends the SMBIOS io.systemd.stub.kernel-cmdline-extra= string to
+# the embedded .cmdline without signing it, so an attacker who controls the
+# firmware/QEMU command line could append a second usrhash=. The stub is patched
+# (packages/systemd/build) to ignore those additions under Secure Boot and to
+# export the embedded .cmdline as /.extra/signed-cmdline; this unit compares the
+# two independently, so a lost patch or another injection channel still fails.
+#
+# Generators have already read usrhash= by the time units start, but nothing is
+# acted on until a mount or mapper device is wanted. Ordering before those is
+# what closes the gap.
+DefaultDependencies=no
+Before=sysroot.mount sysusr-usr.mount systemd-veritysetup@usr.service
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+# A mismatch is a broken verified boot. A reboot loop is loud, runs no
+# attacker-selected code, and does not expose an emergency shell.
+FailureAction=reboot-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The initrd has no journal, so the console is the only trace.
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell: /usr/bin/sh is fish and the initrd has none on the boot path.
+# A missing signed copy is exit 2, not a pass. The program is silent on a match.
+ExecStart=/usr/lib/vngrd/vngrd-cmdline-guard /.extra/signed-cmdline /proc/cmdline

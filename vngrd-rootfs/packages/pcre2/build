@@ -1,0 +1,50 @@
+#!/bin/sh -e
+dest="$1"
+cd pcre2-10.48
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --disable-static \
+    --enable-shared \
+    --enable-pcre2-8 \
+    --enable-pcre2-16 \
+    --enable-pcre2-32 \
+    --enable-jit \
+    --enable-unicode
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# pcre2-config is a development helper -- it prints the link flags for building
+# against pcre2 -- and it ships with a #!/bin/sh shebang, which verify.sh rejects
+# because a merged-/usr rootfs has no /bin/sh. Nothing in this image builds
+# against pcre2, so it is pruned rather than relocated: rewriting the shebang
+# would be a lie about a host tool that is not present, and the /usr/local
+# prefix that the alternative would need is forbidden outright.
+#
+# pcre2test is pruned for the same reason it is not a false positive: it is an
+# interactive test driver, links against the uninstalled .la files, and has no
+# place in an image.
+rm -f "$dest/usr/bin/pcre2-config" "$dest/usr/bin/pcre2test"
+
+# Assert both directions. Each was installed by this package and would otherwise
+# be caught by verify.sh, which is a fine backstop but a bad place to find out.
+for t in pcre2grep; do
+    if [ ! -e "$dest/usr/bin/$t" ]; then
+        echo "pcre2: $t missing from the install" >&2
+        exit 1
+    fi
+done
+for gone in pcre2-config pcre2test; do
+    if [ -e "$dest/usr/bin/$gone" ]; then
+        echo "pcre2: $gone should have been pruned but is present" >&2
+        exit 1
+    fi
+done

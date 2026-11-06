@@ -1,0 +1,28 @@
+#!/bin/sh -e
+
+dest="$1"
+cd libcap-2.78
+
+# Respect sysroot / clang toolchain from kiss.conf
+# libcap's Makefile honors CC/CFLAGS/LDFLAGS but needs lib=lib for /usr/lib
+# SBINDIR must be overridden: Make.Rules defaults to $(exec_prefix)/sbin
+# Disable PAM (requires pam headers) and Go bits (not needed for systemd)
+make -j${JOBS:-$(nproc)} \
+    prefix=/usr \
+    lib=lib \
+    SBINDIR=/usr/bin \
+    PAM_CAP=no \
+    GOLANG=no
+
+make prefix=/usr \
+    lib=lib \
+    SBINDIR=/usr/bin \
+    PAM_CAP=no \
+    GOLANG=no \
+    DESTDIR="$dest" \
+    RAISE_SETFCAP=no \
+    install
+
+# Ensure pkgconfig is in standard sysroot path
+# libcap installs libcap.pc to $prefix/lib/pkgconfig (i.e. /usr/lib/pkgconfig)
+# which matches PKG_CONFIG_LIBDIR=/out/usr/lib/pkgconfig

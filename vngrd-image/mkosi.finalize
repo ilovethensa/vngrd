@@ -1,0 +1,13 @@
+#!/bin/bash
+# mkosi.finalize — thin wrapper. The work is finalize_main() in lib/hooks.sh.
+#
+# mkosi runs this bound at /work/finalize with the source tree read-only at
+# /work/src ($SRCDIR) and the image root at /buildroot ($BUILDROOT). Run
+# directly from the checkout it sources lib/ next to itself instead.
+set -e
+SELF=${BASH_SOURCE[0]}
+DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+ROOT=${SRCDIR:-$DIR}
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/hooks.sh"
+finalize_main "$@"

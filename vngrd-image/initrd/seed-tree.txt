@@ -1,0 +1,27 @@
+# Directories and files copied verbatim into the initrd, by path.
+#
+# One path per line, relative to the rootfs. Text after '#' is a comment; blank
+# lines are ignored. Because this is a data file and not a shell string, a '#'
+# is safe and a backtick is inert — inside the old `seed_tree="..."` literal a
+# '#' line became the seed path "#" and an unbalanced backtick swallowed the
+# rest of the script.
+#
+# usr/lib/systemd is seeded whole (12M), not just system/ and system-generators/:
+# the sibling binaries in that directory are exec'd by path (PID 1 execs
+# systemd-executor before anything else), and none of them is a DT_NEEDED edge,
+# so the closure walk cannot find them.
+#
+# usr/lib/repart.d is deliberately absent: repart reads it from the verified
+# /usr at /sysusr/usr/lib/repart.d, so a copy here would be a second definition
+# the verity hash does not cover.
+usr/lib/systemd
+usr/lib/vngrd
+usr/lib/cryptsetup
+usr/lib/udev/rules.d/10-dm.rules
+usr/lib/udev/rules.d/60-persistent-storage.rules
+usr/lib/udev/rules.d/99-systemd.rules
+usr/lib/udev/rules.d/50-udev-default.rules
+usr/lib/udev/rules.d/90-vconsole.rules
+usr/lib/udev/rules.d/tpm-udev.rules
+usr/lib/os-release
+usr/lib/gconv/gconv-modules

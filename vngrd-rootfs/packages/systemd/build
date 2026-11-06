@@ -1,0 +1,326 @@
+#!/bin/sh -e
+dest="$1"
+cd systemd-262
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# clang 14+ with glibc 2.44 _Generic strstr triggers this as an error.
+export CFLAGS="$CFLAGS -Wno-error=incompatible-pointer-types-discards-qualifiers"
+export CXXFLAGS="$CXXFLAGS -Wno-error=incompatible-pointer-types-discards-qualifiers"
+
+# Merged /usr: systemd hardcodes /sbin/* despite --sbindir=/usr/bin. Fix at
+# source so the package is hermetic.
+sbin_before=$(grep -c '/sbin' units/*.in units/*.service 2>/dev/null | awk -F: '{n+=$2} END{print n+0}')
+sed -i 's|/sbin/|/usr/bin/|g' units/*.in 2>/dev/null || true
+sed -i 's|/sbin/|/usr/bin/|g' units/*.service 2>/dev/null || true
+sed -i 's|/usr/sbin/|/usr/bin/|g' units/*.in units/*.service 2>/dev/null || true
+sbin_after=$(grep -c '/sbin' units/*.in units/*.service 2>/dev/null | awk -F: '{n+=$2} END{print n+0}')
+# The first sed rewrites /usr/sbin/ only via the third rule, so "after" is not
+# expected to be 0. A leftover /sbin is only a problem if the first pass changed
+# nothing, meaning upstream moved the hardcoding out of these globs.
+if [ "$sbin_before" -gt 0 ] && [ "$sbin_after" -ge "$sbin_before" ]; then
+    echo "systemd: /sbin rewrite did not take effect (before=$sbin_before after=$sbin_after)" >&2
+    exit 1
+fi
+
+# MinVersion= specifier expansion was broken through 257.5: the value was
+# expanded but validated unexpanded, so version_is_valid("%A") failed and the
+# constraint was dropped. Fixed upstream in 093cac3fe8b4; v262 has it. This is an
+# assertion, not a sed patch: a silently non-matching patch is the failure mode.
+# MinVersion= is the only downgrade guard (sysupdate's scan has no ordering), and
+# on a factory image a missing one skips the newest-installed comparison.
+if ! grep -q 'version_is_valid(resolved' src/sysupdate/sysupdate-transfer.c; then
+    echo "systemd: MinVersion= specifier fix is missing from this tree" >&2
+    echo "  expected version_is_valid(resolved in src/sysupdate/sysupdate-transfer.c" >&2
+    echo "  (it was 'version_is_valid(rvalue)' through 257.5; fixed in 093cac3fe8b4)." >&2
+    echo "  MinVersion= would be dropped with a warning and downgrade protection is gone." >&2
+    exit 1
+fi
+
+# vngrd: the kernel command line is signed, and nothing outside the signature
+# may extend it under Secure Boot.
+#
+# 1. SMBIOS Type 11 io.systemd.stub.kernel-cmdline-extra= is appended after the
+#    signed .cmdline. Upstream gates it only on is_confidential_vm(), but SMBIOS
+#    is host/VMM-controlled, and the last usrhash= wins: a host-injected string
+#    can point /usr at another verity pair. Gate it on Secure Boot.
+# 2. Addon .cmdline sections are PE-verified but are not the signed .cmdline;
+#    this image ships no addons, so drop them under Secure Boot too.
+# 3. Expose the signed .cmdline as /.extra/signed-cmdline so the initrd can
+#    compare it with what the kernel received. PCA/11 already measures it.
+#
+# Each patch is idempotent and asserted below, so a moved code site fails the
+# build instead of shipping an unpatched stub.
+python3 - <<'PYEOF'
+import pathlib, sys
+
+p = pathlib.Path("src/boot/stub.c")
+s = p.read_text()
+rc = 0
+
+# --- 1: SMBIOS gate -------------------------------------------------------
+smbios_old = """        /* SMBIOS OEM Strings data is controlled by the host admin and not covered by the VM attestation, so
+         * MUST NOT be trusted when in a confidential VM */
+        if (is_confidential_vm())
+                return;
+"""
+smbios_new = smbios_old + """
+        /* vngrd: an SMBIOS Type 11 OEM string is host-controlled, unsigned, and
+         * appended *after* the signed .cmdline, so the last occurrence of a
+         * parameter would win over the one the UKI signature carries. Same
+         * answer the boot-loader command line gets below. */
+        if (secure_boot_enabled())
+                return;
+"""
+if "vngrd: an SMBIOS Type 11 OEM string" in s:
+    pass
+elif s.count(smbios_old) != 1:
+    print("systemd: stub.c SMBIOS gate site not found exactly once", file=sys.stderr)
+    rc = 1
+else:
+    p.write_text(s.replace(smbios_old, smbios_new))
+
+# --- 2: addon cmdline gate ------------------------------------------------
+s = p.read_text()
+addon_old = "        cmdline_append_and_measure_addons(cmdline_addons, &cmdline, &parameters_measured);\n"
+addon_new = """        /* vngrd: addon .cmdline sections are not the signed command line. See
+         * the SMBIOS gate in cmdline_append_and_measure_smbios() above. */
+        if (!secure_boot_enabled())
+                cmdline_append_and_measure_addons(cmdline_addons, &cmdline, &parameters_measured);
+"""
+if "vngrd: addon .cmdline sections" in s:
+    pass
+elif s.count(addon_old) != 1:
+    print("systemd: stub.c addon cmdline site not found exactly once", file=sys.stderr)
+    rc = 1
+else:
+    p.write_text(s.replace(addon_old, addon_new))
+
+# --- 3: expose the signed .cmdline through /.extra/signed-cmdline ---------
+s = p.read_text()
+idx_old = "        INITRD_OSREL,\n"
+idx_new = "        INITRD_OSREL,\n        INITRD_CMDLINE, /* vngrd: the signed .cmdline, for vngrd-cmdline-guard */\n"
+if "INITRD_CMDLINE" in s:
+    pass
+elif s.count(idx_old) != 1:
+    print("systemd: stub.c InitrdIndex enum site not found exactly once", file=sys.stderr)
+    rc = 1
+else:
+    p.write_text(s.replace(idx_old, idx_new))
+
+s = p.read_text()
+tbl_old = '                { UNIFIED_SECTION_OSREL,   INITRD_OSREL,   u"os-release"              },\n'
+tbl_new = tbl_old + """
+                /* vngrd: hand the embedded command line to the booted system, so the
+                 * initrd can check what the kernel received against what the UKI it
+                 * came from said. The section itself is already measured into PCR 11. */
+                { UNIFIED_SECTION_CMDLINE, INITRD_CMDLINE, u"signed-cmdline"          },
+"""
+if "INITRD_CMDLINE, u\"signed-cmdline\"" in s:
+    pass
+elif s.count(tbl_old) != 1:
+    print("systemd: stub.c embedded-initrd table site not found exactly once", file=sys.stderr)
+    rc = 1
+else:
+    p.write_text(s.replace(tbl_old, tbl_new))
+
+sys.exit(rc)
+PYEOF
+
+# The three insertions, asserted by content so a moved site is a build failure
+# rather than a boot that trusts a command line it should not.
+grep -q 'vngrd: an SMBIOS Type 11 OEM string' src/boot/stub.c || {
+    echo "systemd: SMBIOS cmdline gate did not apply" >&2; exit 1; }
+grep -q 'vngrd: addon .cmdline sections' src/boot/stub.c || {
+    echo "systemd: addon cmdline gate did not apply" >&2; exit 1; }
+grep -q 'INITRD_CMDLINE, u"signed-cmdline"' src/boot/stub.c || {
+    echo "systemd: /.extra/signed-cmdline did not apply" >&2; exit 1; }
+
+# vngrd: a pcrlock policy credential must come from this machine. The ESP is the
+# pre-unseal transport. Upstream encrypts it with a NULL key and accepts any
+# null-key credential; the SRK/NV handle match that follows is not authenticity,
+# because both handles are in the world-readable LUKS2 header. An ESP write can
+# therefore substitute a policy. vngrd-pcrlock-esp.service seals the legitimate
+# one with --with-key=tpm2; this patch refuses the null-key form.
+#
+# A machine with a wiped ESP has no policy credential and already falls back to
+# the recovery passphrase. No intended input is null-key.
+python3 - <<'PYEOF'
+import pathlib, sys
+
+p = pathlib.Path("src/shared/tpm2-util.c")
+s = p.read_text()
+
+old = """                        UID_INVALID,
+                        data,
+                        CREDENTIAL_ALLOW_NULL,
+                        &decoded);
+        if (r < 0)
+                return r;
+
+        if (memchr(decoded.iov_base, 0, decoded.iov_len))
+                return log_error_errno(r, "Credential '%s' contains embedded NUL byte, refusing.", name);"""
+new = """                        UID_INVALID,
+                        data,
+                        /* vngrd: a null-key pcrlock policy is an unauthenticated
+                         * one, and the handle match that follows is not an
+                         * authenticity check (both handles are in the world-readable
+                         * LUKS2 header). Refuse them; the only credential this
+                         * image writes for this purpose is systemd-creds
+                         * encrypt --with-key=tpm2. See vngrd-pcrlock-esp.service. */
+                        CREDENTIAL_REFUSE_NULL,
+                        &decoded);
+        if (r < 0)
+                return r;
+
+        if (memchr(decoded.iov_base, 0, decoded.iov_len))
+                return log_error_errno(r, "Credential '%s' contains embedded NUL byte, refusing.", name);"""
+if "vngrd: a null-key pcrlock policy is an unauthenticated" in s:
+    sys.exit(0)
+if s.count(old) != 1:
+    print("systemd: tpm2-util.c pcrlock credential flags site not found exactly once", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new, 1))
+PYEOF
+grep -q 'vngrd: a null-key pcrlock policy is an unauthenticated' src/shared/tpm2-util.c || {
+    echo "systemd: pcrlock null-key refusal did not apply" >&2; exit 1; }
+
+# -Dtpm=false compiles tpm_log_tagged_event() to a no-op, so sd-boot measures
+# nothing and the PCR 11 claims are inert. Do not use it to quiet warnings; fix
+# the measurement instead. -Dtpm2 is unrelated (TPM 1.2).
+#
+# -Dtpm2-nvpcr-base is pinned so the NV index handles are a property of this
+# repository. Decimal 30474752 == 0x01d10200 because meson rejects hex integers.
+
+# -Dsysupdate owns slot bookkeeping; -Dimportd is mandatory because sysupdate
+# execs systemd-import/systemd-pull, which needs libcurl.
+#
+# Configure from scratch: meson reuses cached options in build/, so a changed
+# flag is silently ignored when the version and script did not change.
+#
+# homed and userdb stay off for security. homed trusts any *.public key in its
+# hardcoded directory, and /var lives inside the sealed root, whose GPT label is
+# unauthenticated: an attacker with disk write can substitute the whole volume,
+# enroll their own key, and get uid 0. A baked account is the answer here.
+#
+# This comment stays above the command: a # inside a backslash-continued command
+# ends that command (sh then tries the first -D line as a program).
+rm -rf build
+meson setup --cross-file /packages/systemd/meson-cross.ini build \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --libexecdir=/usr/lib \
+    --sbindir=/usr/bin \
+    -Dsplit-bin=false \
+    --sysconfdir=/etc \
+    --localstatedir=/var \
+    --buildtype=release \
+    -Dmode=release \
+    -Ddefault-dnssec=no \
+    -Dfirstboot=false \
+    -Dinstall-tests=false \
+    -Dldconfig=false \
+    -Dsysusers=true \
+    -Drpmmacrosdir=no \
+    -Dhomed=disabled \
+    -Duserdb=false \
+    -Dman=disabled \
+    -Dhtml=disabled \
+    -Dukify=enabled \
+    -Dnobody-group=nogroup \
+    -Dnobody-user=nobody \
+    -Dpam=disabled \
+    -Daudit=disabled \
+    -Dselinux=disabled \
+    -Dapparmor=disabled \
+    -Dpolkit=disabled \
+    -Dblkid=enabled \
+    -Didn=false \
+    -Dlibidn2=disabled \
+    -Dxkbcommon=disabled \
+    -Dpcre2=enabled \
+    -Dseccomp=enabled \
+    -Dzlib=enabled \
+    -Dzstd=enabled \
+    -Dlz4=disabled \
+    -Dxz=enabled \
+    -Dbzip2=disabled \
+    -Dopenssl=enabled \
+    -Dgnutls=disabled \
+    -Dlibcurl=enabled \
+    -Dmicrohttpd=disabled \
+    -Dbpf-framework=disabled \
+    -Dtpm=true \
+    -Dtpm2=enabled \
+    -Dtpm2-nvpcr-base=30474752 \
+    -Defi=true \
+    -Dbootloader=enabled \
+    -Dkmod=disabled \
+    -Dacl=disabled \
+    -Dgcrypt=disabled \
+    -Dlibcryptsetup=enabled \
+    -Dlibcrypt=disabled \
+    -Dqrencode=disabled \
+    -Dp11kit=disabled \
+    -Dlibfido2=disabled \
+    -Delfutils=disabled \
+    -Ddbus=disabled \
+    -Dutmp=false \
+    -Dhibernate=false \
+    -Dlocaled=false \
+    -Dmachined=false \
+    -Dportabled=false \
+    -Dsysext=false \
+    -Dsysinstall=false \
+    -Dnspawn=disabled \
+    -Dimds=disabled \
+    -Dsysupdate=enabled \
+    -Dimportd=enabled \
+    -Danalyze=true \
+    -Dhostnamed=false \
+    -Dtimedated=false \
+    -Dtimesyncd=false \
+    -Dnetworkd=false \
+    -Dresolve=false \
+    -Doomd=false \
+    -Dsulogin-path=/usr/bin/sulogin \
+    -Dnologin-path=/usr/bin/nologin
+
+ninja -C build -j${JOBS:-$(nproc)}
+DESTDIR="$dest" ninja -C build install
+
+# -Dbootloader=enabled installs the unsigned sd-boot that mkosi signs; the host's
+# vngrd-bootloader-sync copies the signed file. Fail the build if it is absent.
+if [ ! -f "$dest/usr/lib/systemd/boot/efi/systemd-bootx64.efi" ]; then
+    echo "systemd: usr/lib/systemd/boot/efi/systemd-bootx64.efi is missing" >&2
+    echo "  -Dbootloader=enabled did not install the loader; mkosi cannot sign it," >&2
+    echo "  and vngrd-bootloader-sync has no source to copy to the ESP." >&2
+    exit 1
+fi
+
+# -Dtpm=true must really compile tpm_log_tagged_event() into sd-boot; a silently
+# degraded measurement is exactly what this guards.
+if ! grep -q 'tpm_log_tagged_event' src/boot/boot.c; then
+    echo "systemd: tpm_log_tagged_event is absent from src/boot/boot.c" >&2
+    echo "  sd-boot would measure nothing and the whole PCR chain is inert." >&2
+    exit 1
+fi
+
+# Two unused hooks carry #!/bin/sh, which verify.sh rejects and this image has no
+# POSIX shell to rewrite onto (/usr/bin/sh is fish): the X11 xinitrc hook (Wayland
+# only) and 50-depmod.install (the kernel package ships its own modules).
+rm -f "$dest/etc/X11/xinit/xinitrc.d/50-systemd-user.sh"
+rmdir -p --ignore-fail-on-non-empty "$dest/etc/X11/xinit/xinitrc.d" 2>/dev/null || true
+rm -f "$dest/usr/lib/kernel/install.d/50-depmod.install"
+rmdir -p --ignore-fail-on-non-empty "$dest/usr/lib/kernel/install.d" 2>/dev/null || true
+
+for gone in usr/lib/kernel/install.d/50-depmod.install \
+            etc/X11/xinit/xinitrc.d/50-systemd-user.sh; do
+    if [ -e "$dest/$gone" ]; then
+        echo "systemd: $gone should have been pruned but is present" >&2
+        exit 1
+    fi
+done

@@ -1,0 +1,74 @@
+# Executables the initrd takes the DT_NEEDED closure of.
+#
+# One path per line, relative to the rootfs. Text after '#' is a comment.
+#
+# The non-obvious entries:
+#   mount, umount   systemd's built-in ExecStart/ExecStop for .mount units; no
+#                   unit file mentions them, so no scan finds them, and without
+#                   mount every API VFS mount (including the verity /usr) fails
+#                   while the boot still looks healthy.
+#   sulogin         the emergency shell's login prompt; failed-boot path only.
+#   touch, flock    ExecStartPost of several oneshots; flock is the wrapper
+#                   systemd-tmpfiles and systemd-sysusers run through.
+#   mkdir           creates the /etc/systemd/system confinement mount.
+#   mountpoint      ditto; a non-zero exit is a fail-closed check.
+#   udevadm         populates /dev.
+#   printf, cat, ls, sync
+#                   exec'd by absolute path and linked by nothing, so the
+#                   closure walk cannot see them. A missing /usr/bin/printf made
+#                   vngrd-provision.service fail before enrolling anything, with
+#                   the console naming only the unit.
+#   systemd-pcrextend
+#                   the PCR 11 phase barrier behind systemd-pcrphase-initrd.
+#                   Without it enter-initrd is never measured and the TPM never
+#                   unseals the root.
+#   systemd-ask-password
+#                   what systemd-cryptsetup execs for a passphrase: the initrd's
+#                   fallback when the TPM cannot release the key.
+#   vngrd-cmdline-guard
+#                   checks that /proc/cmdline is the one the signed UKI's .cmdline
+#                   says (/.extra/signed-cmdline). Two files and a compare, no TPM
+#                   and no crypttab, and it is the runtime half of the stub patch
+#                   that stops an SMBIOS Type 11 OEM string from appending to a
+#                   signed command line. Without it an unsigned host-injected
+#                   usrhash= names a different /usr verity pair and nothing in the
+#                   boot notices.
+#
+# No shell: usr/bin/sh is a symlink to fish (12M) and /bin/sh does not exist in
+# a merged-/usr rootfs. No module machinery either: the kernel is CONFIG_MODULES=n.
+usr/lib/systemd/systemd
+usr/lib/systemd/systemd-pcrextend
+usr/bin/systemd-repart
+usr/bin/systemd-cryptsetup
+usr/bin/mkfs.ext4
+usr/bin/udevadm
+usr/bin/mount
+usr/bin/umount
+usr/bin/sulogin
+usr/bin/touch
+usr/bin/flock
+usr/bin/mkdir
+usr/bin/printf
+usr/bin/cat
+usr/bin/ls
+usr/bin/sync
+usr/bin/mountpoint
+usr/bin/systemd-tmpfiles
+usr/bin/systemd-sysusers
+usr/bin/systemd-machine-id-setup
+usr/bin/systemd-hwdb
+usr/bin/systemctl
+usr/bin/journalctl
+usr/bin/rm
+usr/bin/systemd-creds
+usr/bin/systemd-cryptenroll
+usr/bin/systemd-ask-password
+usr/bin/tpm2
+usr/bin/tpm2_nvdefine
+usr/bin/tpm2_nvread
+usr/bin/tpm2_nvwrite
+usr/bin/tpm2_nvundefine
+usr/bin/tpm2_eventlog
+usr/bin/ln
+usr/bin/systemd-tty-ask-password-agent
+usr/lib/vngrd/vngrd-cmdline-guard

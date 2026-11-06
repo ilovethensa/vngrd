@@ -1,0 +1,41 @@
+# Source URL aliases.
+#
+# Every source URL is declared here first, one entry per package-version.
+# (`unaliased-url` itself is deliberately NOT fatal -- see project.conf's
+# comment: the sha256 in the element is the guarantee, this file is the
+# provenance record. The registry is kept anyway, for two reasons:
+#
+#   * vngrd is a security product. An upstream tarball can be replaced at any
+#     URL. The sha256 in each element is what actually protects the build; this
+#     file is what makes "which URL did that hash come from" answerable later
+#     without digging through git history.
+#   * AGENTS.md prefers cdn.kernel.org / fossils as source hosts. An alias is how
+#     that preference is expressed without editing thirty elements.
+#
+# The closing paren above: `unaliased-url` is not fatal, so this is a
+# convention, not a gate -- but keeping it filled costs one line a port.
+#
+# Note the schema is name + a mapping of alias -> list of URIs. There is no
+# `url:` key: an alias expands to a LIST, because one name may need several
+# mirrors. Writing `url:` is rejected at load time.
+mirrors:
+- name: upstream
+  aliases:
+    zlib-ng-2.3.3:
+    - https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz
+    libcap-2.78:
+    - https://cdn.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.78.tar.xz
+    libseccomp-2.6.1:
+    - https://github.com/seccomp/libseccomp/releases/download/v2.6.1/libseccomp-2.6.1.tar.gz
+    libxcrypt-4.5.2:
+    - https://github.com/besser82/libxcrypt/releases/download/v4.5.2/libxcrypt-4.5.2.tar.xz
+    expat-2.8.5:
+    - https://github.com/libexpat/libexpat/releases/download/R_2_8_5/expat-2.8.5.tar.gz
+    pcre2-10.48:
+    - https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz
+    json-c-0.19:
+    - https://s3.amazonaws.com/json-c_releases/releases/json-c-0.19.tar.gz
+    xz-5.8.4:
+    - https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.xz
+    zstd-1.5.7:
+    - https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz

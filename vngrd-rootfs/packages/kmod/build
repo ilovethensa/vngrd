@@ -1,0 +1,28 @@
+#!/bin/sh -e
+dest="$1"
+cd kmod-34
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# Merged /usr: kmod defaults to /lib/modules but vngrd is hermetic /usr/lib only.
+# Fix at source — mkosi run_depmod chroot expects /usr/lib/modules, not compat symlink.
+# Single-pass to avoid /usr/usr/lib double-patch ( /usr/lib/modules contains /lib/modules substring)
+find . -type f -exec sed -i 's|/lib/modules|/usr/lib/modules|g' {} + 2>/dev/null || true
+
+meson setup --cross-file /packages/systemd/meson-cross.ini build \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --buildtype=release \
+    -Dmanpages=false \
+    -Dopenssl=enabled \
+    -Dxz=enabled \
+    -Dzlib=enabled \
+    -Dzstd=enabled \
+    -Dbuild-tests=false
+
+ninja -C build -j${JOBS:-$(nproc)}
+DESTDIR="$dest" ninja -C build install

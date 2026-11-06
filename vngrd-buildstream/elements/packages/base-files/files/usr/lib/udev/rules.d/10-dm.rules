@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Device-mapper target naming, trimmed from LVM2 udev/10-dm.rules.in.
+#
+# The kernel registers a target as /dev/dm-N only (drivers/md/dm.c sets
+# disk_name to "dm-%d"); /dev/mapper/<name> is a symlink that device-mapper's
+# udev rules create. We build libdm and libcryptsetup with --disable-udev, so
+# those rules are absent — without this file /dev/mapper/usr never appears and
+# dev-mapper-usr.device times out in the initrd. 99-systemd.rules already tags
+# block devices for systemd, so the device reaches systemd and systemd resolves
+# this symlink by devnum.
+#
+# No DM_COOKIE/dmsetup flag decoding: we ship no dmsetup. The kernel exports
+# DM_NAME in the uevent and in sysfs since 2.6.29, so $attr{dm/name} suffices.
+# "add" fires while the target is still an empty container; dm re-emits "change"
+# once the table is loaded, and that is where the name becomes available.
+
+ACTION=="remove", GOTO="dm_end"
+SUBSYSTEM!="block", GOTO="dm_end"
+KERNEL!="dm-[0-9]*", GOTO="dm_end"
+
+OPTIONS+="db_persist"
+
+ENV{DM_NAME}!="?*", ENV{DM_NAME}="$attr{dm/name}"
+ENV{DM_NAME}!="?*", GOTO="dm_end"
+ENV{DM_UDEV_DISABLE_DM_RULES_FLAG}=="1", GOTO="dm_end"
+
+SYMLINK+="mapper/$env{DM_NAME}"
+
+LABEL="dm_end"

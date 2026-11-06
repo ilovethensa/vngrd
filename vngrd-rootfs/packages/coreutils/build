@@ -1,0 +1,24 @@
+#!/bin/sh -e
+dest="$1"
+cd coreutils-9.7
+
+# The builder container runs as root by design; coreutils' configure refuses
+# root otherwise (its mknod/fifo privilege test is meaningless as root).
+export FORCE_UNSAFE_CONFIGURE=1
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --libexecdir=/usr/lib \
+    --enable-no-install-program=arch,hostname,hostid \
+    gl_cv_func_working_mktime=yes \
+    gl_cv_func_working_mktime_internal=yes
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install

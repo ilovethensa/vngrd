@@ -1,0 +1,33 @@
+[Unit]
+# Refuse a boot whose partition table is not the one this machine was provisioned
+# with.
+#
+# PCR 7 only names the Secure Boot policy, and PCR 5 is not in the seal because
+# the root partition does not exist when the volume is sealed. A substituted
+# disk, a re-provisioned layout, or a different signed vngrd image would
+# therefore unseal. The GPT digest is frozen into TPM NV by vngrd-gpt-freeze and
+# recomputed here.
+#
+# The register is read with OWNERREAD, so no volume key is needed. Fail-closed:
+# no frozen digest means the machine is not provisioned, and the boot passes. A
+# digest that exists but cannot be re-checked is a refusal.
+#
+# After systemd-repart.service: repart writes the root partition before it appends
+# fixate-volume-key= to the crypttab, and a guard running between those moments
+# would mistake a healthy first boot for a deleted register.
+DefaultDependencies=no
+After=sysusr-usr.mount systemd-repart.service
+Before=sysroot.mount
+Before=systemd-cryptsetup@vngrd\x2droot.service
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+FailureAction=reboot-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell: /usr/bin/sh is fish and the initrd has none on this path.
+ExecStart=/usr/lib/vngrd/vngrd-gpt-guard

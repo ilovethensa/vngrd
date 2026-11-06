@@ -1,0 +1,50 @@
+[Unit]
+# Enrol the root recovery passphrase, in the initrd.
+#
+# The passphrase is the only thing that makes a TPM failure recoverable, and it
+# must be enrolled while the TPM still unseals: between the root opening and
+# leave-initrd being measured. After that the PolicyAuthorize over enter-initrd
+# no longer matches and a host-side cryptenroll cannot open the volume.
+#
+# The passphrase is prompted, not generated: a generated key would have to be
+# printed to a journal that lives on the disk it unlocks. It is the same keyslot
+# a recovery key would be, and the operator is at the console anyway.
+Description=Enrol a root recovery passphrase for the LUKS2 volume (once)
+Documentation=man:systemd-cryptenroll(1) man:systemd-cryptsetup@.service(8)
+DefaultDependencies=no
+# The marker lands in the real /var, so the root must be mounted, not just open.
+After=sysroot.mount
+Before=initrd-switch-root.target
+# The ask-password agents are stopped at cryptsetup.target; without this the
+# prompt has no agent and the unit times out.
+Wants=systemd-ask-password-console.path
+After=systemd-ask-password-console.path
+ConditionPathExists=!/sysroot/var/lib/vngrd/recovery-key-enrolled
+
+[Service]
+Type=oneshot
+UMask=0077
+# The initrd journal is volatile and the console is the only durable trace. The
+# passphrase itself is never echoed.
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStartPre=/usr/bin/mkdir -p /sysroot/var/lib/vngrd
+ExecStartPre=/usr/bin/printf '\n*** vngrd: choose the ROOT RECOVERY PASSPHRASE now. ***\n*** It is a keyslot, so it needs no TPM: it is the fallback when the TPM2\n*** PIN fails or is forgotten, and the way in after a firmware or dbx\n*** update moves PCR 7 until the token has been re-sealed. It is not\n*** printed again, so record it somewhere safe.\n\n'
+# Use the partition node: cryptenroll closes the volume before adding a keyslot,
+# and an already-open dm device makes it refuse. --password asks the operator;
+# --recovery-key would generate and print the value.
+#
+# vngrd-passphrase asks twice, enforces length/diversity, then execs cryptenroll
+# with NEWPASSWORD. cryptenroll's own quality check is only a warning.
+ExecStart=/usr/lib/vngrd/vngrd-passphrase --new -- /usr/bin/systemd-cryptenroll --unlock-tpm2-device=auto --password /dev/disk/by-partlabel/vngrd-root
+# vngrd-tpm-pin.service gates on this marker so it cannot wipe the only
+# non-passphrase keyslot before this one exists.
+ExecStartPost=/usr/bin/touch /sysroot/var/lib/vngrd/recovery-key-enrolled
+TimeoutStartSec=10min
+
+# The firmware event log dump is diagnostic. The seal is PCR 7 plus
+# PolicyAuthorize over PCR 11; PCR 5 is deliberately absent because repart
+# creates the root after the firmware has measured the GPT. Prefixed with `-'
+# so a firmware without an event log cannot fail provisioning.
+ExecStartPost=-/usr/bin/printf '*** vngrd: firmware event log follows (diagnostic; the root seal is PCR 7 + PolicyAuthorize over PCR 11).\n'
+ExecStartPost=-/usr/bin/tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurements

@@ -1,0 +1,45 @@
+# Unified kernel image for a slot: kernel, initrd and command line in one signed
+# PE, with the usrhash= of its slot. Slot selection is "boot the entry whose hash
+# matches the content", so two slots must never hold identical content: equal
+# content means equal hash-derived partition UUIDs, ambiguous by-partuuid links,
+# and a verity failure.
+#
+# Naming follows the UAPI boot loader interface, type #2: "+<tries-left>-
+# <tries-done>" before the suffix. sd-boot decrements and renames before handing
+# off, so an attempt is consumed even if the kernel never starts; exhausted
+# entries sort last. systemd-bless-boot removes the counters once healthy and
+# finds the ESP by probing /efi, /boot and /boot/efi, not by GPT label.
+#
+# No integrity check, for the reason written out in 50-usr.transfer: the digest
+# gate is URL-only and Type=regular-file has no checksum key.
+[Transfer]
+ProtectVersion=%A
+# Same downgrade floor as 50-usr.transfer: the two /usr halves and the UKI are
+# meaningful only as a set, and MinVersion must hold on both.
+MinVersion=%A
+
+[Source]
+Type=regular-file
+Path=/var/lib/vngrd/update/
+MatchPattern=vngrd_@v.efi.xz
+
+[Target]
+Type=regular-file
+# PathRelativeTo=boot resolves to $BOOT, falling back to the ESP when there is
+# no XBOOTLDR partition. Type #2 UKIs are auto-discovered from EFI/Linux, which
+# is where the image puts them.
+Path=/EFI/Linux
+PathRelativeTo=boot
+# ORDER MATTERS. The first pattern is the one new entries are named with, so
+# this yields vngrd_<v>+3-0.efi. The list must stay most-specific-first: the
+# bare pattern would otherwise also match vngrd_0.1+3.efi and extract the
+# nonsensical version "0.1+3". TriesLeft/TriesDone are only emitted because
+# @l/@d appear here.
+MatchPattern=vngrd_@v+@l-@d.efi vngrd_@v+@l.efi vngrd_@v.efi
+Mode=0444
+TriesLeft=3
+TriesDone=0
+# Keep the running and the new UKI. A third file exists only transiently while
+# an update is being written (a dot-prefixed temp file in the same directory),
+# which is what sizes the ESP at three UKIs.
+InstancesMax=2

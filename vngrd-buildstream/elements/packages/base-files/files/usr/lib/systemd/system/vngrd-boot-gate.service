@@ -1,0 +1,32 @@
+[Unit]
+Description=Vngrd slot consistency gate for systemd-bless-boot
+Documentation=man:systemd.special(7) man:systemd-bless-boot.service(8)
+# Requires= from boot-complete.target.requires/ is the mechanism. Wants= and
+# Before= do not propagate failure, and Condition...= is skipped rather than
+# failed, so none of them can gate the blessing.
+#
+# boot-complete.target is opt-in and was only pulled in by
+# systemd-bless-boot.service, which bless-boot-generator adds only when a
+# LoaderBootCountPath exists. The factory entry has no +N-M token, so the gate
+# would never run on a fresh machine. default.target.wants/boot-complete.target
+# puts the target in the transaction unconditionally; the Requires= here still
+# makes a failed gate fail it.
+#
+# Late in the boot: after multi-user.target, so "this slot came up" is the
+# question, and a slot that hangs halfway is never blessed.
+After=multi-user.target graphical.target default.target
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# A wedged trigger or unreadable device must not hold the boot.
+TimeoutStartSec=30s
+# Ignore status failure: it exits non-zero both when boot counting is not in
+# effect (the factory entry has no +N-M token) and when no ESP is found. Neither
+# is a reason to veto the consistency checks below.
+ExecStartPre=-/usr/lib/systemd/systemd-bless-boot status
+ExecStart=/usr/lib/vngrd/boot-gate.fish
+# The operator is looking at a login prompt; a skipped blessing must be visible.
+StandardOutput=journal+console
+StandardError=journal+console

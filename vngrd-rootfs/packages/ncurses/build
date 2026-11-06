@@ -1,0 +1,87 @@
+#!/bin/sh -e
+dest="$1"
+cd ncurses-6.5
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --mandir=/usr/share/man \
+    --with-shared \
+    --with-normal \
+    --without-debug \
+    --without-ada \
+    --enable-widec \
+    --with-manpage-format=normal \
+    --enable-pc-files \
+    --with-pkg-config-libdir=/usr/lib/pkgconfig
+
+make -j${JOBS:-$(nproc)}
+
+# Hide $dest/usr/bin/sh for the install, and put it back after.
+#
+# misc/run_tic.sh builds PATH as "../progs:../lib:${DESTDIR}$bindir:$PATH" before
+# running `sh ./shlib', so the FIRST `sh' it finds during the terminfo install is
+# the one in $dest/usr/bin -- and fish's package installs exactly that name
+# (usr/bin/sh -> fish). shlib is dash syntax and dies at its CDPATH line 71
+# "In fish, please use 'set CDPATH'", taking `make install' with it.
+#
+# This is why the failure is a REBUILD-only failure and reads as nonsense the
+# first time: on a from-scratch build ORDER puts ncurses (4th) before fish (last),
+# $dest/usr/bin/sh does not exist yet, and the same command falls through to the
+# container's dash. It only bites when the tree already holds a previous fish --
+# which is every incremental build, including CI's.
+#
+# Move aside rather than `rm': restore below even if the install fails partway,
+# so a failed build leaves the tree as it found it.
+_sh_saved=""
+if [ -e "$dest/usr/bin/sh" ] || [ -L "$dest/usr/bin/sh" ]; then
+    _sh_saved=$(mktemp -d)
+    mv "$dest/usr/bin/sh" "$_sh_saved/entry" 2>/dev/null || {
+        rm -f "$dest/usr/bin/sh" || true
+        _sh_saved="gone:$_sh_saved"
+    }
+fi
+restore_sh() {
+    case "${_sh_saved:-}" in
+        "") return 0 ;;
+        gone:*) rm -rf "${_sh_saved#gone:}" ;;
+        *) mv "$_sh_saved/entry" "$dest/usr/bin/sh" 2>/dev/null || true
+           rmdir "$_sh_saved" 2>/dev/null || true ;;
+    esac
+}
+trap restore_sh EXIT
+
+make DESTDIR="$dest" install
+restore_sh
+trap - EXIT
+
+# ncurses installs widec libs as libncursesw — provide libncurses symlink for fish
+ln -sf libncursesw.so "$dest/usr/lib/libncurses.so" 2>/dev/null || true
+ln -sf libncursesw.so "$dest/usr/lib/libcurses.so" 2>/dev/null || true
+
+# ncursesw6-config is a development helper that prints link flags for building
+# against ncurses, and it ships with a #!/bin/sh shebang. verify.sh rejects any
+# #!/bin/* interpreter because a merged-/usr rootfs has no /bin/sh, and
+# AGENTS.md forbids /usr/local, so there is nowhere to relocate it that is both
+# legal and honest about a host tool that will not be there. Nothing in this
+# image builds against ncurses, so it is dropped.
+#
+# The tic and infocmp binaries stay: fish and systemd-localed use them, and they
+# are C.
+rm -f "$dest/usr/bin/ncursesw6-config"
+if [ -e "$dest/usr/bin/ncursesw6-config" ]; then
+    echo "ncurses: ncursesw6-config should have been pruned but is present" >&2
+    exit 1
+fi
+for t in tic infocmp; do
+    if [ ! -e "$dest/usr/bin/$t" ]; then
+        echo "ncurses: $t missing from the install" >&2
+        exit 1
+    fi
+done

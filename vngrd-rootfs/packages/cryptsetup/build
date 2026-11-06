@@ -1,0 +1,32 @@
+#!/bin/sh -e
+dest="$1"
+cd cryptsetup-2.8.8
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --disable-asciidoc \
+    --disable-static \
+    --enable-cryptsetup \
+    --enable-veritysetup \
+    --disable-ssh-token \
+    --disable-udev \
+    --with-crypto_backend=openssl
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Ensure no sbin
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin" 2>/dev/null || true
+fi

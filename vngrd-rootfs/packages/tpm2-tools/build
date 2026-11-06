@@ -1,0 +1,63 @@
+#!/bin/sh -e
+dest="$1"
+cd tpm2-tools-5.8
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# tpm2-tools, for the NV subcommands the fixate hash needs. systemd cannot read a
+# plain TPM2 NV index into a crypttab option, so read/write are ours.
+#
+# Shipped rather than a ~150-line C program: tpm2-tools is upstream code already
+# in the same TSS trust domain, at the cost of its libcurl edge (pruned below).
+# The initrd closure is computed in mk-initrd-root, so only these binaries land
+# there.
+#
+# --disable-fapi: optional auto-detect, and tss2-fapi is not shipped.
+# --disable-unit: cmocka is a test-only dependency.
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --localstatedir=/var \
+    --runstatedir=/run \
+    --disable-static \
+    --disable-fapi \
+    --disable-unit \
+    --disable-dependency-tracking
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Prune to the commands this image runs: the fixate hash and tpm2_eventlog, the
+# provisioning diagnostic for firmware measurements. PCR 5 is not in the seal
+# (repart creates the root after the firmware measures the GPT), so the GPT is
+# bound by the NV digest instead. Keep the list explicit, not globbed.
+KEEP="tpm2_nvdefine tpm2_nvread tpm2_nvwrite tpm2_nvundefine tpm2_eventlog"
+for t in $KEEP; do
+    if [ ! -x "$dest/usr/bin/$t" ]; then
+        echo "tpm2-tools: $t missing from the install" >&2
+        exit 1
+    fi
+done
+for f in "$dest"/usr/bin/tpm2_*; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f")
+    case " $KEEP " in
+        *" $b "*) ;;
+        *) rm -f "$f" ;;
+    esac
+done
+# Bash completions and man pages for the pruned tools are noise; drop the lot.
+rm -rf "$dest/usr/share/bash-completion" "$dest/usr/share/man" "$dest/usr/share/doc"
+
+# libcurl enters through the tcti libraries. verify.sh checks DT_NEEDED, and
+# tpm2-tss must have been built first in ORDER.
+if [ ! -e "$dest/usr/lib/libtss2-esys.so.0" ]; then
+    echo "tpm2-tools: libtss2-esys missing; tpm2-tss must be built first" >&2
+    exit 1
+fi

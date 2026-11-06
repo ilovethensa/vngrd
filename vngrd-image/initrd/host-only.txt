@@ -1,0 +1,45 @@
+# Absolute paths a unit execs that are deliberately absent from the initrd.
+#
+# Format: <path> then whitespace then a reason; continuation lines are indented
+# and are part of the reason. Text after '#' is a comment. The check is a fixed
+# substring match, so only the path itself needs to appear.
+#
+# A path here is a decision, not a silence: anything a unit references and that
+# is neither present nor listed here fails the build.
+/etc/rc.local                     rc-local.service, not enabled anywhere
+/usr/lib/vngrd/boot-gate.fish     vngrd-boot-gate.service, host-side by design:
+                                  bless-boot-generator returns early when in_initrd()
+/usr/bin/quotaon                 quotaon@.service and quotaon-root.service, never enabled
+/usr/bin/pam_namespace_helper     pam_namespace.service; there is no PAM in the initrd
+/usr/bin/pcre2grep                vngrd-boot-gate.service, same as boot-gate.fish
+/usr/lib/systemd/systemd-journal-upload  excluded above; needs libcurl and has
+                                  nothing to push to before / exists
+/bin/sh                            there is no /bin in a merged-/usr tree, in the
+                                  rootfs or in the previous whole-rootfs initrd
+                                  either, and the boot completed without one. The
+                                  units that want it are the ones that would be run
+                                  by hand from an emergency shell
+/usr/bin/mount                    vngrd-pcrlock-esp.service, host-side: the pcrlock
+                                  policy is written to the ESP from the host (the
+                                  initrd runs before the root exists), and the ESP is an
+                                  automount that nothing has triggered at that point
+/usr/bin/mountpoint               vngrd-pcrlock-esp.service: the check that the mount
+                                  above really is the ESP. Without it a failed mount
+                                  writes the credential to /efi on the ROOT volume,
+                                  where the ESP's mount then hides it -- which is how
+                                  this unit spent its first day failing
+/usr/bin/cmp                      vngrd-pcrlock-esp.service, host-side like the two
+                                  above: it is the second half of the unit's
+                                  decrypt-verify, comparing the credential it just
+                                  wrote against the policy it was made from. The
+                                  initrd never writes this file (the policy is
+                                  generated in the host's /var), so the unit is
+                                  ConditionPathExists=!/etc/initrd-release there and
+                                  the binary would be dead weight in a cpio that is
+                                  signed and size-metered
+/usr/bin/agetty                    getty units; the initrd has no console to log in on
+/usr/bin/dbus-broker-launch         dbus.service; no bus in the initrd
+/usr/lib/systemd/systemd-pcrlock   systemd-pcrlock-*.service, host-side by design:
+                                  they are ConditionPathExists=!/etc/initrd-release
+                                  and generate the policy in the real /var, which
+                                  does not exist in the initrd

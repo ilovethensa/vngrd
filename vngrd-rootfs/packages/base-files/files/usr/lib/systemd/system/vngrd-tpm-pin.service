@@ -1,0 +1,41 @@
+[Unit]
+# Add a TPM2 PIN to the root's token, in the initrd, on the first boot.
+#
+# repart creates the token PIN-less because it runs unattended. This unit
+# replaces it after vngrd-provision.service has enrolled the recovery passphrase
+# and before the PCR 11 window closes. --unlock-tpm2-device=auto works because
+# the token is still PIN-less; the PIN is hashed into the token policy and never
+# stored, so a compromised TPM alone does not release the volume key.
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+ConditionPathExists=!/sysroot/var/lib/vngrd/tpm-enrolled
+# Never replace the only non-passphrase keyslot before a recovery passphrase
+# keyslot actually exists.
+ConditionPathExists=/sysroot/var/lib/vngrd/recovery-key-enrolled
+# Fallback only: the pcrlock path ran and did not finish. Its ExecStopPost
+# writes this even when an ExecStartPre aborts.
+ConditionPathExists=/sysroot/var/lib/vngrd/pcrlock-attempted
+After=vngrd-provision.service vngrd-tpm-pcrlock.service
+# leave-initrd moves PCR 11, and --unlock-tpm2-device=auto verifies the token
+# against the live enter-initrd value. Order against initrd-switch-root.service
+# too, or the pivot kills the enrolment mid-flight.
+Before=vngrd-leave-initrd.service initrd-switch-root.service initrd-switch-root.target
+# The ask-password agents are stopped at cryptsetup.target; this still prompts.
+Wants=systemd-ask-password-console.path
+After=systemd-ask-password-console.path
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The prompt has to be visible on the serial console.
+StandardOutput=journal+console
+StandardError=journal+console
+# No [Install]: pulled in from initrd-root-fs.target.wants, which exists only in
+# the initrd.
+ExecStart=/usr/bin/systemd-cryptenroll --unlock-tpm2-device=auto --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11 --tpm2-with-pin=yes /dev/disk/by-partlabel/vngrd-root
+ExecStartPost=/usr/bin/touch /sysroot/var/lib/vngrd/tpm-pin-enrolled
+# One enrolment per machine, either pcrlock+PIN or bare+PIN.
+ExecStartPost=/usr/bin/touch /sysroot/var/lib/vngrd/tpm-enrolled
+# A human types the PIN, and the console may be slow.
+TimeoutStartSec=10min

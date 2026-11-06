@@ -1,0 +1,22 @@
+#!/bin/sh -e
+dest="$1"
+# Handle both popt-1.19 and popt-popt-1.19-release directory names
+if [ -d popt-1.19 ]; then cd popt-1.19; elif [ -d popt-popt-1.19-release ]; then cd popt-popt-1.19-release; else cd popt*; fi
+if [ ! -f configure ]; then
+    if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fiv; fi
+fi
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install

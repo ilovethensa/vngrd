@@ -1,0 +1,19 @@
+# Libraries the initrd's tools dlopen() by SONAME at run time.
+#
+# A closure walk cannot find these: libsystemd-shared-262.so has DT_NEEDED of
+# libc and ld-linux only, and the TSS2 stack is loaded by name. readelf follows
+# DT_NEEDED, so it walks straight past them, and the initrd once shipped with no
+# libtss2-esys at all — the symptom being a root that cannot unseal.
+#
+# These are take()n, not copied: they are symlink chains, so a plain `cp -a`
+# reproduces the link without its target and the initrd fails at unseal time.
+#
+# libtss2-sys is .so.1, not .so.0: tpm2-tss 4.x bumped that soname while the
+# other five keep .so.0.
+usr/lib/libtss2-esys.so.0
+usr/lib/libtss2-mu.so.0
+usr/lib/libtss2-rc.so.0
+usr/lib/libtss2-tcti-device.so.0
+usr/lib/libtss2-sys.so.1
+usr/lib/libtss2-tctildr.so.0
+usr/lib/libnss_files.so.2

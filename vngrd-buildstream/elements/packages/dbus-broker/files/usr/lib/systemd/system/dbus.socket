@@ -1,0 +1,13 @@
+[Unit]
+Description=D-Bus System Message Bus Socket
+Before=sockets.target shutdown.target
+Conflicts=shutdown.target
+
+[Socket]
+ListenStream=/run/dbus/system_bus_socket
+SocketMode=0666
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target
+Also=dbus-broker.service

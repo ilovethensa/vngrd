@@ -1,0 +1,25 @@
+#!/bin/sh -e
+dest="$1"
+cd libseccomp-2.6.1
+
+# Fix sysroot interpreter for configure test binaries
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --disable-static \
+    --enable-shared
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Ensure pkgconfig in standard path
+mkdir -p "$dest/usr/lib/pkgconfig"
+if [ ! -f "$dest/usr/lib/pkgconfig/libseccomp.pc" ] && [ -f "$dest/usr/share/pkgconfig/libseccomp.pc" ]; then
+    mv "$dest/usr/share/pkgconfig/libseccomp.pc" "$dest/usr/lib/pkgconfig/"
+fi

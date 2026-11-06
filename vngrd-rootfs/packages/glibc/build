@@ -1,0 +1,90 @@
+#!/bin/sh -e
+
+dest="$1"
+
+# Bootstrap: glibc provides the sysroot, so no --sysroot; point at /out headers.
+export CFLAGS="-O2 -pipe -march=x86-64 -I/out/usr/include"
+export CXXFLAGS="$CFLAGS"
+export CPPFLAGS="-I/out/usr/include"
+
+# Bake /usr/lib/ld-linux-x86-64.so.2 into every ELF at link time: relocating
+# $dest/lib64 later moves the file, not PT_INTERP. The symlink lets the container's
+# executed configure tests resolve it now.
+mkdir -p /usr/lib
+ln -sf /lib64/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+export LDFLAGS="-Wl,-O1 -Wl,--as-needed -fuse-ld=lld -Wl,--dynamic-linker=/usr/lib/ld-linux-x86-64.so.2"
+export PKG_CONFIG_SYSROOT_DIR=""
+export PKG_CONFIG_LIBDIR=""
+export PKG_CONFIG_PATH=""
+
+# Source is at /work/glibc-2.44 (extracted as work/glibc/glibc-2.44)
+mkdir -p /work/build
+cd /work/build
+
+# Based on Arch PKGBUILD flags, minimal for vngrd
+/work/glibc-2.44/configure \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --libexecdir=/usr/lib \
+    --with-headers=/out/usr/include \
+    --enable-kernel="$KISS_KERNEL" \
+    --enable-bind-now \
+    --enable-stack-protector=strong \
+    --disable-nscd \
+    --disable-profile \
+    --disable-werror \
+    --without-selinux \
+    CC=gcc \
+    CXX=g++ \
+    AR=ar \
+    RANLIB=ranlib \
+    LD=ld
+
+# rtlddir is overridden on the make line alongside slibdir: configure writes it
+# separately from the build host's /lib64 into config.make, and Makeconfig appends
+# installed-rtld-LDFLAGS after our LDFLAGS. The last -dynamic-linker wins, so
+# without this every installed tool still requests /lib64, which verify.sh rejects.
+make -j${JOBS:-$(nproc)} slibdir=/usr/lib rtlddir=/usr/lib sbindir=/usr/bin rootsbindir=/usr/bin
+make DESTDIR="$dest" slibdir=/usr/lib rtlddir=/usr/lib sbindir=/usr/bin rootsbindir=/usr/bin install
+
+# Unified /usr: move /lib64 and /lib to /usr/lib; no top-level directories.
+if [ -d "$dest/lib64" ]; then
+    mkdir -p "$dest/usr/lib"
+    mv "$dest/lib64"/* "$dest/usr/lib/" 2>/dev/null || true
+    rmdir "$dest/lib64" 2>/dev/null || true
+fi
+if [ -d "$dest/lib" ] && [ ! -L "$dest/lib" ]; then
+    mkdir -p "$dest/usr/lib"
+    if [ -n "$(ls -A "$dest/lib" 2>/dev/null)" ]; then
+        mv "$dest/lib"/* "$dest/usr/lib/" 2>/dev/null || true
+    fi
+    rmdir "$dest/lib" 2>/dev/null || true
+fi
+# No top-level /lib symlinks — pure /usr (as requested)
+
+# ld.so was installed as a relative link pointing at the removed ../../lib64;
+# repoint it where the loader now lives.
+if [ -L "$dest/usr/bin/ld.so" ] || [ -L "$dest/usr/lib/ld.so" ]; then
+    ln -sfn ../lib/ld-linux-x86-64.so.2 "$dest/usr/lib/ld.so" 2>/dev/null || true
+    rm -f "$dest/usr/bin/ld.so" 2>/dev/null || true
+fi
+
+# Fixup linker scripts that still reference /lib64 (sysroot is /usr/lib)
+if [ -f "$dest/usr/lib/libc.so" ]; then
+    sed -i 's|/lib64/ld-linux|/usr/lib/ld-linux|g' "$dest/usr/lib/libc.so"
+fi
+
+# glibc installs four bash scripts (ldd, sotruss, tzselect, xtrace). Delete them:
+# the image has no bash, and rewriting the shebang to fish would look runnable
+# while dying on bash syntax.
+rm -f "$dest/usr/bin/ldd" "$dest/usr/bin/sotruss" "$dest/usr/bin/tzselect" \
+      "$dest/usr/bin/xtrace"
+
+# Safety net: nothing may install to a top-level sbin
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin"
+fi
+
+# Keep kernel headers (installed by linux-headers) — don't remove

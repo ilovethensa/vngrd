@@ -1,0 +1,43 @@
+#!/bin/sh -e
+dest="$1"
+cd tpm2-tss-4.2.0
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# tpm2-tss needs autoreconf if from git, but tarball has configure
+if [ ! -f configure ]; then
+    ./bootstrap 2>/dev/null || autoreconf -fiv
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --localstatedir=/var \
+    --runstatedir=/run \
+    --disable-static \
+    --enable-esys \
+    --disable-fapi \
+    --with-udevrulesdir=/usr/lib/udev/rules.d
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Ensure no sbin and no /usr/var (should be /var)
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin" 2>/dev/null || true
+fi
+if [ -d "$dest/usr/var" ]; then
+    mkdir -p "$dest/var"
+    mv "$dest/usr/var"/* "$dest/var/" 2>/dev/null || true
+    rmdir "$dest/usr/var" 2>/dev/null || true
+fi
+# Ensure no /usr/local or /var/run
+rm -rf "$dest/usr/local" 2>/dev/null || true

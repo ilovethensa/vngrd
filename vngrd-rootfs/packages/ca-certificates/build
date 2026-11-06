@@ -1,0 +1,42 @@
+#!/bin/sh -e
+# ca-certificates — Mozilla's CA root store, as published by curl.se.
+#
+# Why a package at all: nothing in the base system carried trust anchors, so
+# every TLS client in the tree failed verification. That matters for
+# systemd-sysupdate once its source is url-file, which is downloaded with
+# libcurl (the curl package exists for exactly that reason), and it is the same
+# reason the openssl build cannot do a verified handshake today.
+#
+# Source: https://curl.se/ca/cacert.pem is the bundle extracted from Mozilla's
+# NSS store by curl's caextract script, regenerated as the store changes. The
+# package version is the date the bundle reports ("Certificate data from Mozilla
+# as of: ..."), so an upstream regeneration is picked up by bumping the version.
+# checksums stays SKIP per the project convention; if you want pinning, put the
+# sha256 of the bundle you validated here.
+dest="$1"
+cd /work
+
+BUNDLE=cacert.pem
+[ -f "$BUNDLE" ] || { echo "ca-certificates: $BUNDLE missing from work/" >&2; exit 1; }
+
+# Sanity check: a truncated or HTML-error-body download must fail here, not at
+# some unrelated TLS handshake later.
+n=$(grep -c 'BEGIN CERTIFICATE' "$BUNDLE")
+[ "$n" -gt 50 ] || { echo "ca-certificates: only $n certificates in $BUNDLE, refusing" >&2; exit 1; }
+echo "ca-certificates: $n CA certificates ($(wc -c < "$BUNDLE") bytes)"
+
+# The tmpfiles rule that exposes the store under /etc, same convention as
+# base-files: the static tree is copied verbatim into DESTDIR.
+cp -a "$(dirname "$0")/files/." "$dest/"
+
+install -Dm644 "$BUNDLE" "$dest/usr/share/ca-certificates/mozilla.crt"
+
+# Clients look for the bundle under /etc (curl's compiled-in default is
+# /etc/ssl/certs/ca-certificates.crt, with /etc/ssl/certs as capath), but /etc
+# on a running system is the writable root, populated by tmpfiles and the
+# factory tree, not the image. So the store lives in /usr and a symlink is
+# created at boot -- see files/usr/lib/tmpfiles.d/10-ca-certificates.conf.
+#
+# Deliberately not modelled on Debian's per-certificate .crt files plus
+# update-ca-certificates: this bundle is regenerated upstream, not locally, so
+# there is nothing to merge and a symlink is the whole mechanism.

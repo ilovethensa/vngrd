@@ -1,0 +1,14 @@
+# Root filesystem of this machine: a LUKS2 container whose only key is sealed
+# to the TPM2, bound to PCR 7 (the Secure Boot policy) — see
+# /usr/lib/repart.d/10-root.conf and systemd-repart.service.d/10-device.conf.
+#
+# The entry is static (no LUKS UUID) because the device is named by its fixed GPT
+# label, and the mapper name is the one the kernel command line refers to:
+# root=/dev/mapper/vngrd-root. That has to be the mapper rather than the
+# partition, because the fstab-generator takes root= verbatim — it does not
+# follow a LUKS wrapper — and the mount then waits for this unit through the
+# dev-disk-by\x2dpartlabel-vngrd\x2droot.device dependency instead.
+#
+# x-initrd.attach: opened during the initrd → host transition, i.e. before
+# /sysroot is mounted.
+vngrd-root /dev/disk/by-partlabel/vngrd-root none tpm2-device=auto,x-initrd.attach

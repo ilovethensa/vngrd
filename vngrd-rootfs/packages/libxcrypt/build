@@ -1,0 +1,22 @@
+#!/bin/sh -e
+dest="$1"
+cd libxcrypt-4.5.2
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# clang is strict with -Werror — disable incompatible-pointer-types error
+export CFLAGS="$CFLAGS -Wno-error -Wno-error=incompatible-pointer-types-discards-qualifiers"
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --disable-static \
+    --enable-shared \
+    --enable-hashes=all
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install

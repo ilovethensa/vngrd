@@ -1,0 +1,16 @@
+#!/bin/sh -e
+dest="$1"
+cd openssl-3.6.4
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./Configure --prefix=/usr --libdir=lib --openssldir=/etc/ssl no-ssl3 no-tests
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Move engines to correct place if needed
+mkdir -p "$dest/usr/lib/pkgconfig" 2>/dev/null || true

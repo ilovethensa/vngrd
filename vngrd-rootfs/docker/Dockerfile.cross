@@ -1,0 +1,17 @@
+FROM debian:bookworm-slim
+
+# Cross toolchain placeholder — replace with your target arch toolchain.
+# Example: apt-get install -y gcc-aarch64-linux-gnu
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    python3 \
+    xz-utils \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

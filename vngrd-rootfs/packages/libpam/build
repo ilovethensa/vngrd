@@ -1,0 +1,75 @@
+#!/bin/sh -e
+dest="$1"
+cd Linux-PAM-1.7.2
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# Minimal PAM for util-linux login: no docs, no systemd integration yet
+meson setup --cross-file /packages/systemd/meson-cross.ini build \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --buildtype=release \
+    -Ddocs=disabled \
+    -Daudit=disabled \
+    -Deconf=disabled \
+    -Dselinux=disabled \
+    -Dlogind=disabled \
+    -Delogind=disabled \
+    -Dopenssl=disabled \
+    -Dexamples=false \
+    -Dpam_userdb=disabled \
+    -Dnis=disabled \
+    -Dpwaccess=disabled \
+    -Disadir=/usr/lib/security
+
+ninja -C build -j${JOBS:-$(nproc)}
+DESTDIR="$dest" ninja -C build install
+
+# Ensure pam headers are in standard location for util-linux
+# meson already installs to /usr/include/security
+
+# pam_namespace is removed, and this is a capability decision rather than a
+# packaging tidy-up.
+#
+# Linux-PAM has no meson option to leave a module out -- meson_options.txt
+# exposes only the feature toggles, and pam_namespace is built unconditionally --
+# so the only way to drop it is to remove what it installs.
+#
+# It is unusable in this image either way. pam_namespace_helper is a shell
+# script and namespace.init is a shell snippet, both with #!/bin/sh, and there
+# is no POSIX shell to run them: /usr/bin/sh is a symlink to fish (see
+# scripts/mk-initrd-root's seed list, which declines to seed sh for that
+# reason), and the initrd has no shell at all. Rewriting the shebangs to
+# /usr/bin/sh to satisfy verify.sh would pass the check and then run a
+# security-sensitive mount-namespace helper under a shell that does not speak
+# POSIX -- strictly worse than not having it.
+#
+# Nothing references it: the seven PAM stacks in
+# /usr/share/factory/etc/pam.d (login, other, system-auth, system-local-login,
+# system-login, system-remote-login, system-services) do not name pam_namespace,
+# and the config is regenerated from the factory tree at every boot, so this
+# cannot be re-enabled by a stray /etc edit either. If a future config does need
+# it, the image needs a real POSIX shell first.
+rm -f "$dest/usr/bin/pam_namespace_helper"
+rm -f "$dest/usr/share/pam/security/namespace.init"
+rm -f "$dest/usr/lib/security/pam_namespace.so"
+rm -f "$dest/usr/lib64/security/pam_namespace.so" 2>/dev/null || true
+
+# Assert it stayed out, and that the modules which *do* work are still present --
+# verify.sh only catches the shebang files, not a half-removed module.
+for gone in usr/bin/pam_namespace_helper usr/lib/security/pam_namespace.so; do
+    if [ -e "$dest/$gone" ]; then
+        echo "libpam: $gone should have been removed but is present" >&2
+        exit 1
+    fi
+done
+for t in pam_unix.so pam_deny.so pam_permit.so pam_env.so; do
+    if [ ! -e "$dest/usr/lib/security/$t" ]; then
+        echo "libpam: $t missing from the install" >&2
+        exit 1
+    fi
+done

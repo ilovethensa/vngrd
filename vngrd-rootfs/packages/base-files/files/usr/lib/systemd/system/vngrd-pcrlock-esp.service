@@ -1,0 +1,45 @@
+[Unit]
+Description=Write the TPM PCRLock policy to the ESP for the next boot's initrd
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=!/etc/initrd-release
+ConditionPathExists=/var/lib/systemd/pcrlock.json
+After=local-fs.target systemd-pcrlock-make-policy.service
+Before=shutdown.target sysinit.target
+# The ESP is an automount, so order by path, not by unit name: efi.mount is
+# written by a late generator and does not exist at job-creation time.
+RequiresMountsFor=/efi
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+# An automount mounts on access, so mount the ESP explicitly and check that it is
+# a mountpoint before writing. Without the check a failed mount silently writes
+# the credential onto the root filesystem.
+ExecStartPre=/usr/bin/mkdir -p /efi
+ExecStartPre=-/usr/bin/mount -t vfat /dev/disk/by-partlabel/vngrd-esp /efi
+ExecStartPre=/usr/bin/mountpoint -q /efi
+# Every boot, not once: a firmware or dbx update changes the policy, and the ESP
+# copy is the only one the initrd can read before the root is open.
+ExecStartPre=/usr/bin/mkdir -p /efi/loader/credentials
+# The policy is not secret, but the ESP is writable storage and the LUKS2 token
+# only compares the SRK/NV handles, which live in the unauthenticated header.
+# Sealing to this machine's SRK and PCR 7 makes a substituted credential
+# unreadable on another machine or under a different Secure Boot policy.
+#
+# Deliberately not --with-key=auto-initrd: its null-key fallback is a silent
+# downgrade. packages/systemd/build also patches the loader to refuse null-key
+# pcrlock credentials.
+ExecStart=/usr/bin/systemd-creds encrypt --name=pcrlock.%m --with-key=tpm2 --tpm2-pcrs=7 /var/lib/systemd/pcrlock.json /efi/loader/credentials/pcrlock.%m.cred
+
+# Decrypt with the same seal/unseal pair the initrd uses, so a torn write fails
+# here instead of leaving a root that only the recovery passphrase opens.
+# No shell: ExecStartPost= is not run through one, and /usr/bin/sh is fish.
+ExecStartPost=/usr/bin/systemd-creds decrypt /efi/loader/credentials/pcrlock.%m.cred /run/vngrd-pcrlock-verify
+ExecStartPost=/usr/bin/cmp -s /run/vngrd-pcrlock-verify /var/lib/systemd/pcrlock.json
+ExecStartPost=-/usr/bin/rm -f /run/vngrd-pcrlock-verify
+
+[Install]
+WantedBy=sysinit.target

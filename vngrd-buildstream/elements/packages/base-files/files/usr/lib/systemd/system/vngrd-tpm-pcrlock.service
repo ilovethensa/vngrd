@@ -1,0 +1,48 @@
+[Unit]
+# Enrol the root's TPM2 token against a systemd-pcrlock policy, with a PIN, on
+# the first boot only.
+#
+# The token at this point is the PIN-less one repart created, so
+# --unlock-tpm2-device=auto opens it without a prompt and cryptenroll has the
+# volume key. systemd-pcrlock's --policy= is an output path, so the policy is
+# written straight into the real /var at /sysroot/var/lib/systemd/pcrlock.json.
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+ConditionPathExists=!/sysroot/var/lib/vngrd/tpm-enrolled
+# The recovery passphrase keyslot must exist before the only other one is replaced.
+Requires=vngrd-provision.service
+After=vngrd-provision.service sysroot.mount
+# Keep the PCR 11 window open: --unlock-tpm2-device=auto checks the token's
+# PolicyAuthorize against the live enter-initrd value, and leave-initrd moves it.
+# Order against initrd-switch-root.service, not just the target.
+Before=vngrd-leave-initrd.service initrd-switch-root.service initrd-switch-root.target
+# systemd stops the ask-password agents at cryptsetup.target; this still needs
+# to ask for the new PIN twice.
+Wants=systemd-ask-password-console.path
+After=systemd-ask-password-console.path
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+# Generate the definitions in the initrd at the same instant as the prediction.
+# A component generated on the host describes a different boot and the PCR drops
+# as unrecognized.
+ExecStartPre=/usr/lib/systemd/systemd-pcrlock lock-secureboot-policy
+ExecStartPre=/usr/lib/systemd/systemd-pcrlock lock-secureboot-authority
+ExecStartPre=/usr/lib/systemd/systemd-pcrlock lock-firmware-code
+ExecStartPre=/usr/lib/systemd/systemd-pcrlock lock-firmware-config
+# --components= replaces the search path, so both directories are needed: the
+# definitions just written and the shipped components in the verified /usr.
+# --location=850-sysinit requires everything up to 800-leave-initrd to be in the
+# log and allows the later components to be absent.
+ExecStartPre=/usr/lib/systemd/systemd-pcrlock --components=/var/lib/pcrlock.d --components=/sysusr/usr/lib/pcrlock.d --pcr=7,13,14 --location=850-sysinit make-policy --policy=/sysroot/var/lib/systemd/pcrlock.json
+ExecStart=/usr/bin/systemd-cryptenroll --unlock-tpm2-device=auto --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrlock=/sysroot/var/lib/systemd/pcrlock.json --tpm2-with-pin=yes /dev/disk/by-partlabel/vngrd-root
+ExecStartPost=/usr/bin/touch /sysroot/var/lib/vngrd/tpm-enrolled
+# Runs even when an ExecStartPre aborts: vngrd-tpm-pin.service uses this to fall
+# back to a bare PCR 7 + PIN token in the same boot.
+ExecStopPost=/usr/bin/touch /sysroot/var/lib/vngrd/pcrlock-attempted
+# A human reads a PIN prompt and types it twice.
+TimeoutStartSec=10min

@@ -1,0 +1,36 @@
+#!/bin/sh -e
+dest="$1"
+cd dbus-broker-37
+
+# The launcher needs expat + libsystemd (both in the sysroot). Subprojects (c-*
+# helper libs) are fetched by meson; allow network for the wrapper downloads.
+export CFLAGS="$CFLAGS -Wno-error=incompatible-pointer-types"
+meson setup build \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --buildtype=release \
+    -Dlauncher=true \
+    -Ddocs=false \
+    -Daudit=false \
+    -Dapparmor=false \
+    -Dselinux=false \
+    -Dlinux-4-17=true \
+    -Dtests=false
+
+ninja -C build -j${JOBS:-$(nproc)}
+DESTDIR="$dest" ninja -C build install
+
+# meson installs units/catalogs via the pkg-config systemdunitdir (an absolute
+# path), which lands them in $dest/usr/... for binaries but $dest/out for the
+# absolute-path installs when $dest is not empty-root. Fold any $dest/out back.
+if [ -d "$dest/out/usr" ]; then
+    cp -a "$dest/out/usr/." "$dest/usr/"
+    rm -rf "$dest/out"
+fi
+
+# Static D-Bus config files + socket/service units + vendor Wants symlinks
+# (the reference dbus package normally ships these; our /etc is stateless so
+# enablement must live under /usr/lib).
+if [ -d "$(dirname "$0")/files/usr" ]; then
+    cp -a "$(dirname "$0")/files/usr/." "$dest/usr/"
+fi

@@ -1,0 +1,13 @@
+#!/bin/bash
+# mkosi.postoutput — thin wrapper. The work is postoutput_main() in lib/hooks.sh.
+#
+# mkosi runs this bound at /work/postoutput with the source tree read-only at
+# /work/src ($SRCDIR), the staging output at /work/out ($OUTPUTDIR) and
+# $IMAGE_VERSION in the environment.
+set -e
+SELF=${BASH_SOURCE[0]}
+DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+ROOT=${SRCDIR:-$DIR}
+source "$ROOT/lib/common.sh"
+source "$ROOT/lib/hooks.sh"
+postoutput_main "$@"

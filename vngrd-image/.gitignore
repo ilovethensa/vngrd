@@ -1,0 +1,13 @@
+mkosi.cache/
+mkosi.output/
+mkosi.builddir/
+mkosi.tools/
+.cache/
+*.raw
+*.img
+*.uki
+__pycache__/
+
+# Local signing keys (private material, machine-specific paths)
+mkosi.conf.d/
+keys/local/

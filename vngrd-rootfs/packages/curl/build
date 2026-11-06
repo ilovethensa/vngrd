@@ -1,0 +1,66 @@
+#!/bin/sh -e
+dest="$1"
+cd curl-8.22.0
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# curl's configure exports LD_LIBRARY_PATH=$CURL_LIBRARY_PATH for link tests and
+# never unsets it. It picks up the sysroot libdir, so later host tools resolve the
+# newer sysroot glibc through the container loader and die with GLIBC_PRIVATE
+# __pointer_chk_guard — while configure reports the misleading "libs not available
+# runtime". Drop the export; the rpath and sysroot loader already cover the tests.
+sed -i 's/^\( *\)LD_LIBRARY_PATH=\$CURL_LIBRARY_PATH:\$old$/\1LD_LIBRARY_PATH=$old/' configure
+grep -c 'LD_LIBRARY_PATH=\$CURL_LIBRARY_PATH' configure || true
+
+# systemd links libcurl because importd (systemd-import/pull, used by sysupdate) is
+# gated on it. Minimal features: TLS via openssl, zlib, nothing else. There is no
+# CA bundle yet, which only matters if updates become url-file.
+./configure \
+    --prefix=/usr \
+    --with-openssl \
+    --with-zlib \
+    --without-nghttp2 \
+    --without-libpsl \
+    --without-brotli \
+    --without-zstd \
+    --without-libidn2 \
+    --without-libssh2 \
+    --without-librtmp \
+    --without-gssapi \
+    --without-libgsasl \
+    --without-hyper \
+    --disable-ldap \
+    --disable-ldaps \
+    --disable-rtsp \
+    --disable-dict \
+    --disable-telnet \
+    --disable-tftp \
+    --disable-pop3 \
+    --disable-imap \
+    --disable-smtp \
+    --disable-gopher \
+    --disable-mqtt \
+    --disable-manual \
+    --disable-docs \
+    --disable-static \
+    --enable-shared
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Two helper scripts carry #!/bin/sh, which does not exist on the target and
+# verify.sh rejects; point them at the merged path.
+for s in "$dest/usr/bin/wcurl" "$dest/usr/bin/curl-config"; do
+    [ -f "$s" ] || continue
+    sed -i '1s|^#!/bin/|#!/usr/bin/|' "$s"
+done
+
+# Merged /usr: curl installs nothing into sbin, but be explicit about the rule.
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin" 2>/dev/null || true
+fi

@@ -1,0 +1,814 @@
+#!/bin/sh -e
+dest="$1"
+# Hermetic /usr: vendor is /usr, /etc empty (factory/sysusers/tmpfiles populate at boot)
+# Copy static files from packages/base-files/files/ to DESTDIR
+cp -a "$(dirname "$0")/files/." "$dest/"
+
+# No /etc payload: /etc is a tmpfs populated from /usr/share/factory/etc in the
+# dm-verity'd /usr by 10-vngrd-etc.conf. Stale files are removed by name because
+# $dest is cumulative and other packages legitimately install /etc files.
+for stale_etc in etc/crypttab etc/shadow etc/hostname etc/shells etc/os-release; do
+    if [ -f "$dest/$stale_etc" ] || [ -L "$dest/$stale_etc" ]; then
+        echo "$0: removing stale $stale_etc from out/ (this package's /etc payload" >&2
+        echo "  moved to usr/share/factory/etc/; out/ is cumulative)" >&2
+        rm -f "$dest/$stale_etc"
+    fi
+done
+
+if [ -d "$(dirname "$0")/files/etc" ]; then
+    stray=$(find "$(dirname "$0")/files/etc" -type f 2>/dev/null)
+    if [ -n "$stray" ]; then
+        echo "$0: files/etc must be empty; /etc is a tmpfs now." >&2
+        echo "  These files would ship into the image and then be SHADOWED by the" >&2
+        echo "  tmpfs, so they would be dead weight that still looks live:" >&2
+        echo "$stray" | sed 's|^|    |' >&2
+        echo "  Move them to files/usr/share/factory/etc/ and add a C line to" >&2
+        echo "  10-vngrd-etc.conf." >&2
+        exit 1
+    fi
+fi
+# Keep the factory copy in step; /etc/os-release is a symlink to /usr/lib/os-release
+# at boot, the copy exists only for factory-reset diffs.
+cp "$dest/usr/lib/os-release" "$dest/usr/share/factory/etc/os-release" 2>/dev/null || true
+
+# Ensure var exists (for overlay)
+mkdir -p "$dest/var"
+
+# Old /usr/lib/vngrd/unit-search-path is no longer used; /etc/systemd/system is a
+# tmpfs. Removed from cumulative out/ so a stale copy cannot ship.
+if [ -e "$dest/usr/lib/vngrd/unit-search-path" ]; then
+    echo "$0: removing stale usr/lib/vngrd/unit-search-path (the tmpfs /etc replaces" >&2
+    echo "  the bind that used it; out/ is cumulative, so the last build left it)" >&2
+    rm -rf "$dest/usr/lib/vngrd/unit-search-path"
+fi
+
+# `find -mindepth 1 -print -quit` rather than a glob, because a shell glob that
+# does not match passes the empty string through and the test would pass for the
+# wrong reason.
+if [ -n "$(find "$dest/usr/lib/vngrd/unit-search-path" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "$0: usr/lib/vngrd/unit-search-path must be empty." >&2
+    echo "  It is bind-mounted read-only over /etc/systemd/system (scripts/mk-initrd-root)," >&2
+    echo "  so anything in it lands at the *highest* precedence in PID 1's unit search" >&2
+    echo "  path -- above /usr/lib/systemd/system, where a same-named file replaces the" >&2
+    echo "  vendor unit instead of merging with it. Enable it at vendor precedence" >&2
+    echo "  (usr/lib/systemd/system/*.wants/) instead, or drop a .service.d/ drop-in." >&2
+    exit 1
+fi
+
+# Enable by committed relative symlinks: these targets have no [Install] and /etc
+# is rebuilt every boot. systemd uses only the basename, so an absolute or dangling
+# link silently stops pulling the unit in; both are checked.
+#
+# vngrd-provision must be linked from initrd-root-fs.target: Before= orders but
+# does not start, and host targets are too late for the TPM to unseal.
+for l in boot-complete.target.requires/vngrd-boot-gate.service \
+         boot-complete.target.requires/vngrd-bootloader-sync.service \
+         boot-complete.target.requires/vngrd-rollback-commit.service \
+         initrd-root-fs.target.wants/vngrd-provision.service \
+         initrd-root-fs.target.wants/vngrd-reseal.service \
+         initrd-root-fs.target.wants/vngrd-rollback-guard.service \
+         initrd-root-fs.target.wants/vngrd-gpt-guard.service \
+         initrd-root-fs.target.wants/vngrd-esp-guard.service \
+         initrd-root-fs.target.wants/vngrd-fixate-guard.service \
+         initrd-root-device.target.wants/vngrd-cmdline-guard.service; do
+    g="usr/lib/systemd/system/$l"
+    [ -L "$dest/$g" ] || { echo "$0: $g must be a symlink" >&2; exit 1; }
+    case "$(readlink "$dest/$g")" in
+        /*) echo "$0: $g must be relative, not $(readlink "$dest/$g")" >&2; exit 1 ;;
+    esac
+    [ -e "$dest/$g" ] || { echo "$0: $g dangles" >&2; exit 1; }
+done
+
+# Fail closed: no condition may skip the guard, and it must run before the verity
+# mount that acts on usrhash=.
+cmdf="$dest/usr/lib/systemd/system/vngrd-cmdline-guard.service"
+grep -qx 'Before=sysroot.mount sysusr-usr.mount systemd-veritysetup@usr.service' "$cmdf" || {
+    echo "$0: vngrd-cmdline-guard.service is not ordered before systemd-veritysetup@usr.service." >&2
+    echo "  The generator has already read usrhash=; the guard must run before the" >&2
+    echo "  mount that acts on it." >&2
+    exit 1
+}
+if grep -qx 'ConditionPathExists=/.extra/signed-cmdline' "$cmdf"; then
+    echo "$0: vngrd-cmdline-guard.service still skips when the signed command line is absent." >&2
+    echo "  A UKI with no .cmdline must fail the boot, not bypass the check." >&2
+    exit 1
+fi
+
+# The guards are asserted by line because every failure is silent: no enablement
+# means no run; an absent index must only be created on the provisioning boot;
+# FailureAction= must stop the boot; ordering after sysroot.mount only observes.
+guard_unit() {
+    local u=$1 exe=$2 f="$dest/usr/lib/systemd/system/$1.service"
+    [ -f "$f" ] || { echo "$0: missing $u.service" >&2; exit 1; }
+    grep -qx 'FailureAction=reboot-force' "$f" || {
+        echo "$0: $u.service has no FailureAction=reboot-force" >&2
+        echo "  Without it a refusal is just a failed unit: the boot carries on past" >&2
+        echo "  the check it failed. See the comment on the unit." >&2
+        exit 1; }
+    grep -qx 'Before=sysroot.mount' "$f" || {
+        echo "$0: $u.service is not Before=sysroot.mount" >&2
+        echo "  The check exists to run before the root is mounted; ordering it after" >&2
+        echo "  does not protect the boot, it observes it." >&2
+        exit 1; }
+    grep -Fqx 'Before=systemd-cryptsetup@vngrd\x2droot.service' "$f" || {
+        echo "$0: $u.service is not before systemd-cryptsetup@vngrd\x2droot.service" >&2
+        echo "  Before=sysroot.mount alone leaves the guard able to race the unseal;" >&2
+        echo "  the volume key must not be released before the check has run." >&2
+        exit 1; }
+    grep -qx 'After=sysusr-usr.mount systemd-repart.service' "$f" || {
+        echo "$0: $u.service is not After=sysusr-usr.mount systemd-repart.service" >&2
+        echo "  It reads the verified /usr (os-release, or nothing at all) and must" >&2
+        echo "  not run before that mount exists. It must also run after repart has" >&2
+        echo "  written both the partition table and the fixate option, or it" >&2
+        echo "  can see the intermediate state and refuse a healthy first boot." >&2
+        exit 1; }
+    grep -qx 'ConditionPathExists=/etc/initrd-release' "$f" || {
+        echo "$0: $u.service is not gated to the initrd" >&2
+        echo "  /etc/initrd-release exists only in the initrd; without the condition" >&2
+        echo "  the unit would also be pulled in on the host, where its targets are not" >&2
+        echo "  part of the boot transaction and the exec path may be gone." >&2
+        exit 1; }
+    grep -qx "ExecStart=$exe" "$f" || {
+        echo "$0: $u.service does not exec $exe" >&2
+        echo "  The control is the program, not the unit." >&2
+        exit 1; }
+}
+guard_unit vngrd-rollback-guard '/usr/lib/vngrd/vngrd-rollback-guard /sysusr/usr/lib/os-release'
+guard_unit vngrd-gpt-guard /usr/lib/vngrd/vngrd-gpt-guard
+guard_unit vngrd-esp-guard /usr/lib/vngrd/vngrd-esp-guard
+guard_unit vngrd-fixate-guard /usr/lib/vngrd/vngrd-fixate-guard
+# Host commit: fail boot-complete rather than reboot.
+commit_u="$dest/usr/lib/systemd/system/vngrd-rollback-commit.service"
+[ -f "$commit_u" ] || { echo "$0: missing vngrd-rollback-commit.service" >&2; exit 1; }
+grep -qx 'Before=boot-complete.target' "$commit_u" || {
+    echo "$0: vngrd-rollback-commit.service is not Before=boot-complete.target" >&2
+    echo "  The floor must be raised before the slot is blessed, or a bad update's" >&2
+    echo "  floor update lands after bless-boot has already accepted the boot." >&2
+    exit 1; }
+grep -qx 'ExecStart=/usr/lib/vngrd/vngrd-rollback-commit /usr/lib/os-release' "$commit_u" || {
+    echo "$0: vngrd-rollback-commit.service does not exec the commit against /usr/lib/os-release" >&2
+    echo "  On the host that path is the verified /usr; anywhere else it would be the" >&2
+    echo "  wrong version string determining the floor." >&2
+    exit 1; }
+# The host commit is increment-only. --create is reserved for the initrd line that
+# runs on the boot repart created the root. If it appeared here, a host root that
+# had undefined the counter could have the next boot define it at the running
+# version, which is exactly the silent downgrade the register exists to stop.
+if grep -q -- '--create' "$commit_u"; then
+    echo "$0: vngrd-rollback-commit.service must not pass --create" >&2
+    echo "  Only the provisioning boot may define an absent counter. The host path" >&2
+    echo "  must fail closed when the register is absent." >&2
+    exit 1
+fi
+
+# The host ESP write runs before boot-complete, through the helper.
+sync_u="$dest/usr/lib/systemd/system/vngrd-bootloader-sync.service"
+[ -f "$sync_u" ] || { echo "$0: vngrd-bootloader-sync.service is missing" >&2; exit 1; }
+grep -qx 'ExecStart=/usr/lib/vngrd/vngrd-bootloader-sync' "$sync_u" || {
+    echo "$0: vngrd-bootloader-sync.service does not exec the sync helper" >&2
+    echo "  The unit without it would succeed and leave the old loader on the ESP." >&2
+    exit 1; }
+grep -qx 'Before=boot-complete.target shutdown.target' "$sync_u" || {
+    echo "$0: vngrd-bootloader-sync.service is not Before=boot-complete.target" >&2
+    echo "  A failed loader copy must not let the slot be blessed." >&2
+    exit 1; }
+grep -qx 'After=local-fs.target' "$sync_u" || {
+    echo "$0: vngrd-bootloader-sync.service is not After=local-fs.target" >&2
+    exit 1; }
+grep -qx 'After=vngrd-pcrlock-esp.service' "$sync_u" || {
+    echo "$0: vngrd-bootloader-sync.service is not ordered after vngrd-pcrlock-esp.service" >&2
+    echo "  Both mount the ESP read-write; writing them concurrently is avoidable." >&2
+    exit 1; }
+
+# Floor creation: --create is honoured only with repart's marker, so later boots
+# are a no-op and a deleted counter is a refusal, not a new DefineSpace.
+fixate_u="$dest/usr/lib/systemd/system/vngrd-fixate.service"
+grep -qx 'ExecStart=/usr/lib/vngrd/vngrd-rollback-commit --create /sysusr/usr/lib/os-release' "$fixate_u" || {
+    echo "$0: vngrd-fixate.service does not create the rollback counter on the provisioning boot" >&2
+    echo "  The counter has never existed before that boot; without this line the" >&2
+    echo "  initrd guard has no floor and the host commit refuses to create one." >&2
+    exit 1; }
+grep -qx 'ExecStart=/usr/lib/vngrd/vngrd-fixate-nvwrite --crypttab=/run/vngrd/repart-crypttab' "$fixate_u" || {
+    echo "$0: vngrd-fixate.service does not read the provisioning marker from /run/vngrd/repart-crypttab" >&2
+    echo "  The crypttab's fixate-volume-key= is the marker that permits defining" >&2
+    echo "  an absent index." >&2
+    exit 1; }
+# GPT freeze is the second ExecStart; without it a provisioned machine has no
+# identity and the guard refuses every boot.
+grep -qx 'ExecStart=/usr/lib/vngrd/vngrd-gpt-freeze' \
+    "$dest/usr/lib/systemd/system/vngrd-fixate.service" || {
+    echo "$0: vngrd-fixate.service does not freeze the GPT identity" >&2
+    echo "  Without this ExecStart nothing ever writes VNGRD_NV_GPT_INDEX, and" >&2
+    echo "  a provisioned machine has no GPT identity to check." >&2
+    exit 1; }
+# The ESP freeze is the third ExecStart; same reason.
+grep -qx 'ExecStart=/usr/lib/vngrd/vngrd-esp-freeze' \
+    "$dest/usr/lib/systemd/system/vngrd-fixate.service" || {
+    echo "$0: vngrd-fixate.service does not freeze the ESP identity" >&2
+    echo "  Without this ExecStart nothing ever writes VNGRD_NV_ESP_INDEX, and" >&2
+    echo "  a provisioned machine has no ESP identity to check." >&2
+    exit 1; }
+
+# The cmdline guard is linked from initrd-root-device.target, earlier than the
+# root-fs target, because only the stub patch stands between an unsigned SMBIOS
+# string and another machine's usrhash=.
+
+# repart is reparented to initrd-usr-fs.target to break a first-boot deadlock:
+# initrd-root-fs.target wants repart, but waits on sysroot.mount, which waits on
+# cryptsetup, which waits on repart. The usr target is reached before the root is
+# opened and repart already needs the verity /usr.
+rm -f "$dest/usr/lib/systemd/system/initrd-root-fs.target.wants/systemd-repart.service"
+# Upstream firstboot auto-enrolment cannot work: repart already created and
+# activated the volume, so it finds nothing and its tty settings steal the console
+# from vngrd-provision and vngrd-tpm-pin.
+rm -f "$dest/usr/lib/systemd/system/initrd.target.wants/systemd-cryptenroll-firstboot.service"
+
+mkdir -p "$dest/usr/lib/systemd/system/initrd-usr-fs.target.wants"
+ln -sfn ../systemd-repart.service \
+      "$dest/usr/lib/systemd/system/initrd-usr-fs.target.wants/systemd-repart.service"
+g="usr/lib/systemd/system/initrd-usr-fs.target.wants/systemd-repart.service"
+[ -L "$dest/$g" ] || { echo "$0: $g must be a symlink" >&2; exit 1; }
+case "$(readlink "$dest/$g")" in
+    /*) echo "$0: $g must be relative" >&2; exit 1 ;;
+esac
+[ -e "$dest/$g" ] || { echo "$0: $g dangles" >&2; exit 1; }
+[ ! -e "$dest/usr/lib/systemd/system/initrd-root-fs.target.wants/systemd-repart.service" ] || {
+    echo "$0: systemd-repart is enabled from initrd-root-fs.target again." >&2
+    echo "  That is the first-boot deadlock documented above; it will show up as a" >&2
+    echo "  machine that sometimes provisions and sometimes lands in emergency mode." >&2
+    exit 1; }
+
+[ ! -e "$dest/usr/lib/systemd/system/initrd.target.wants/systemd-cryptenroll-firstboot.service" ] || {
+    echo "$0: initrd.target.wants/systemd-cryptenroll-firstboot.service is back." >&2
+    echo "  Upstream's --firstboot auto-detection cannot find a device here (repart" >&2
+    echo "  created the root already active), so it only logs a failure -- and it holds" >&2
+    echo "  the tty that vngrd-provision and vngrd-tpm-pin need for their prompts." >&2
+    exit 1
+}
+
+# Keep repart off the host: --tpm2-public-key=/.extra is initramfs-only.
+rm -f "$dest/usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service"
+[ ! -e "$dest/usr/lib/systemd/system/sysinit.target.wants/systemd-repart.service" ] || {
+    echo "$0: systemd-repart is enabled on the host again (sysinit.target.wants)." >&2
+    echo "  Its --tpm2-public-key= is /.extra, an initramfs path, so the host run" >&2
+    echo "  fails on every boot; keep it initrd-only." >&2
+    exit 1; }
+
+# systemd enables the PCR 11 phase units. pcrphase-initrd measures enter-initrd
+# before cryptsetup and leave-initrd at switch-root, which is the key window; do
+# not add another enablement. The host phase units are removed below: with them
+# the .pcrsig would sign later phases and PolicyAuthorize would release for the
+# whole boot. The .pcrsig is enter-initrd only (vngrd-image/scripts/ukify, gated
+# in mkosi.postoutput), and removing the host phases makes the window end there.
+i="usr/lib/systemd/system/initrd.target.wants/systemd-pcrphase-initrd.service"
+[ -L "$dest/$i" ] || {
+    echo "$0: $i is missing or is not a symlink." >&2
+    echo "  Without it enter-initrd is never measured, PCR 11 stays at the stub-only" >&2
+    echo "  value, and the UKI's .pcrsig -- which signs the post-enter-initrd value --" >&2
+    echo "  matches nothing the machine ever reaches. The root then never opens at all." >&2
+    exit 1
+}
+case "$(readlink "$dest/$i")" in
+    /*) echo "$0: $i must be relative" >&2; exit 1 ;;
+esac
+[ -e "$dest/$i" ] || { echo "$0: $i dangles" >&2; exit 1; }
+
+# The phase name is the contract between .pcrsig and pcrextend; a systemd rename
+# would brick the first boot.
+pp_unit="$dest/usr/lib/systemd/system/systemd-pcrphase-initrd.service"
+grep -q "systemd-pcrextend --graceful enter-initrd" "$pp_unit" || {
+    echo "$0: systemd-pcrphase-initrd.service does not extend 'enter-initrd'." >&2
+    echo "  Expected 'systemd-pcrextend --graceful enter-initrd' in ExecStart=." >&2
+    echo "  The UKI's .pcrsig is signed for the enter-initrd phase, and that is the only" >&2
+    echo "  value the TPM will release the volume key for." >&2
+    exit 1
+}
+# --graceful covers a missing TPM only; a broken one must reboot.
+grep -q '^FailureAction=reboot-force' "$pp_unit" || {
+    echo "$0: systemd-pcrphase-initrd.service lacks FailureAction=reboot-force." >&2
+    echo "  A present-but-broken TPM must reboot, not fall through to a silent" >&2
+    echo "  cryptsetup failure, and the key-availability window is the initrd." >&2
+    exit 1
+}
+
+# leave-initrd is split from the vendor ExecStop: that ExecStop races
+# vngrd-provision and systemd orders shutdown first, producing
+# TPM2_RC_PCR_CHANGED and no passphrase keyslot. Ordering is in the unit.
+pp_dropin="$dest/usr/lib/systemd/system/systemd-pcrphase-initrd.service.d/10-vngrd.conf"
+[ -f "$pp_dropin" ] || {
+    echo "$0: $pp_dropin is missing." >&2
+    echo "  Without it the vendor ExecStop is still in force, leave-initrd is still" >&2
+    echo "  extended at the first opportunity, and vngrd-provision loses the race again." >&2
+    exit 1
+}
+# ExecStop= in [Unit] is silently ignored; assert [Service].
+grep -q '^\[Service\]' "$pp_dropin" || {
+    echo "$0: $pp_dropin has no [Service] section." >&2
+    echo "  ExecStop= belongs to [Service]. In [Unit] it is silently ignored, so the" >&2
+    echo "  vendor ExecStop stays in force and the race this drop-in exists to remove" >&2
+    echo "  carries on. Nothing else in the build would notice." >&2
+    exit 1
+}
+# Strip comments: the header quotes the replaced Exec lines, so a raw grep would
+# match its own explanation.
+pp_service=$(sed -n '/^\[Service\]/,$p' "$pp_dropin" | sed 's/^[[:space:]]*#.*//')
+pp_body=$(sed 's/^[[:space:]]*#.*//' "$pp_dropin")
+# The reset must be inside [Service], not merely mentioned.
+printf '%s\n' "$pp_service" | grep -q '^ExecStop=$' || {
+    echo "$0: $pp_dropin does not reset ExecStop= inside [Service]." >&2
+    echo "  Expected a bare 'ExecStop=' after the [Service] header." >&2
+    exit 1
+}
+# An empty ExecStart= would clear the vendor command.
+printf '%s\n' "$pp_service" | grep -q '^ExecStart=' && {
+    echo "$0: $pp_dropin clears ExecStart=, so enter-initrd would never be measured." >&2
+    echo "  Only the ExecStop half is meant to be taken over by vngrd-leave-initrd." >&2
+    exit 1
+}
+printf '%s\n' "$pp_body" | grep -q 'systemd-pcrextend --graceful leave-initrd' && {
+    echo "$0: $pp_dropin re-extends leave-initrd itself." >&2
+    echo "  That is the race it is here to remove. vngrd-leave-initrd.service owns" >&2
+    echo "  leave-initrd; this drop-in only clears the vendor ExecStop." >&2
+    exit 1
+}
+
+lv="usr/lib/systemd/system/vngrd-leave-initrd.service"
+[ -f "$dest/$lv" ] || {
+    echo "$0: $lv is missing, so leave-initrd is never measured." >&2
+    echo "  The volume key would stay releasable for the whole boot, which is the same" >&2
+    echo "  failure as a four-entry .pcrsig and just as silent." >&2
+    exit 1
+}
+lv_unit="$dest/$lv"
+# Strip comments: the unit explains the conflict it must not have.
+lv_body=$(sed 's/^[[:space:]]*#.*//' "$lv_unit")
+# Ordered after enrolment: that is why the unit exists.
+printf '%s\n' "$lv_body" | grep -q '^After=vngrd-provision.service' || {
+    echo "$0: $lv is not ordered After=vngrd-provision.service." >&2
+    echo "  leave-initrd would close the window while systemd-cryptenroll still held a" >&2
+    echo "  TPM session open over PCR 11, and the passphrase would never be enrolled" >&2
+    echo "  (TPM2_RC_PCR_CHANGED, 0x128). That is the bug this unit was split out to fix." >&2
+    exit 1
+}
+# Not Requires=: a failed enrolment must still close the window.
+printf '%s\n' "$lv_body" | grep -qE '^(Requires|BindsTo)=.*vngrd-provision' && {
+    echo "$0: $lv Requires=vngrd-provision.service." >&2
+    echo "  If enrolment fails, this unit would not run and the window would stay open" >&2
+    echo "  for the rest of the boot. Failing closed means running it regardless." >&2
+    exit 1
+}
+printf '%s\n' "$lv_body" | grep -q 'systemd-pcrextend --graceful leave-initrd' || {
+    echo "$0: $lv does not extend leave-initrd." >&2
+    echo "  Expected 'systemd-pcrextend --graceful leave-initrd'. The signed phase is" >&2
+    echo "  enter-initrd, but this one has to be a real systemd phase name too." >&2
+    exit 1
+}
+printf '%s\n' "$lv_body" | grep -q '^Before=initrd-switch-root.target' || {
+    echo "$0: $lv is not Before=initrd-switch-root.target." >&2
+    echo "  Without it leave-initrd could be measured after switch-root, i.e. never." >&2
+    exit 1
+}
+# Same --graceful caveat: this unit closes the window.
+printf '%s\n' "$lv_body" | grep -q '^FailureAction=reboot-force' || {
+    echo "$0: $lv lacks FailureAction=reboot-force." >&2
+    echo "  A present-but-broken TPM must reboot rather than fall through." >&2
+    exit 1
+}
+# Not a conflict partner; that is the racy vendor mechanism.
+printf '%s\n' "$lv_body" | grep -q 'Conflicts=.*initrd-switch-root.target' && {
+    echo "$0: $lv Conflicts=initrd-switch-root.target." >&2
+    echo "  That is the vendor unit's mechanism, and it is what raced the enrolment." >&2
+    echo "  This unit is WantedBy=initrd-switch-root.target instead." >&2
+    exit 1
+}
+lvw="usr/lib/systemd/system/initrd-switch-root.target.wants/vngrd-leave-initrd.service"
+[ -L "$dest/$lvw" ] || {
+    echo "$0: $lvw is missing or is not a symlink." >&2
+    echo "  The unit exists but nothing starts it, so the window is never closed." >&2
+    exit 1
+}
+case "$(readlink "$dest/$lvw")" in
+    /*) echo "$0: $lvw must be relative" >&2; exit 1 ;;
+esac
+[ -e "$dest/$lvw" ] || { echo "$0: $lvw dangles" >&2; exit 1; }
+
+# Remove the host phases; factory-reset and storage-target-mode stay because
+# those targets are never reached here.
+for later in systemd-pcrphase-sysinit.service systemd-pcrphase.service; do
+    for dir in "$dest/usr/lib/systemd/system"/*.wants "$dest/usr/lib/systemd/system"/*.requires; do
+        [ -e "$dir/$later" ] || continue
+        echo "$0: removing $dir/$later" >&2
+        echo "  The root volume key's availability window is the initrd." >&2
+        rm -f "$dir/$later"
+    done
+done
+# A systemd upgrade must not silently re-enable them.
+for later in systemd-pcrphase-sysinit.service systemd-pcrphase.service; do
+    for dir in "$dest/usr/lib/systemd/system"/*.wants "$dest/usr/lib/systemd/system"/*.requires; do
+        [ -e "$dir/$later" ] && { echo "$0: $later is enabled again." >&2; exit 1; }
+    done
+done
+
+# systemd-pcrproduct is host-only and cannot work: the NvPCR write key is only
+# exposed in the initramfs. The seal does not use its measurement.
+rm -f "$dest/usr/lib/systemd/system/sysinit.target.wants/systemd-pcrproduct.service"
+[ ! -e "$dest/usr/lib/systemd/system/sysinit.target.wants/systemd-pcrproduct.service" ] || {
+    echo "$0: systemd-pcrproduct.service is enabled on the host again." >&2
+    exit 1; }
+
+# The recovery passphrase is the only fallback from a TPM failure; its absence
+# is a build failure.
+[ -f "$dest/usr/lib/systemd/system/vngrd-provision.service" ] || {
+    echo "$0: usr/lib/systemd/system/vngrd-provision.service is missing." >&2
+    echo "  Without it the root has no passphrase keyslot and every PCR 7 or" >&2
+    echo "  TPM failure is a brick rather than a prompt." >&2
+    exit 1
+}
+# Ask for it; a generated secret would be copied into the journal and serial log.
+grep -q '^ExecStart=/usr/lib/vngrd/vngrd-passphrase --new -- /usr/bin/systemd-cryptenroll --unlock-tpm2-device=auto --password ' \
+    "$dest/usr/lib/systemd/system/vngrd-provision.service" || {
+    echo "$0: vngrd-provision.service no longer asks for a recovery passphrase." >&2
+    echo "  It must prompt through vngrd-passphrase, which enforces the quality" >&2
+    echo "  floor, then exec systemd-cryptenroll with --password." >&2
+    exit 1
+}
+if grep -qE '^ExecStart=.*--recovery-key' "$dest/usr/lib/systemd/system/vngrd-provision.service"; then
+    echo "$0: vngrd-provision.service still uses --recovery-key." >&2
+    echo "  That generates the secret and prints it to the console/journal;" >&2
+    echo "  --password asks the operator and leaves no copy in a log." >&2
+    exit 1
+fi
+grep -q '^Wants=systemd-ask-password-console.path$' \
+    "$dest/usr/lib/systemd/system/vngrd-provision.service" || {
+    echo "$0: vngrd-provision.service has no ask-password console agent." >&2
+    echo "  It runs after cryptsetup.target, where the agent has been stopped," >&2
+    echo "  and the prompt would block until the unit times out." >&2
+    exit 1
+}
+if grep -qE '^\[Install\]' "$dest/usr/lib/systemd/system/vngrd-provision.service"; then
+    echo "$0: vngrd-provision.service must have no [Install] section." >&2
+    echo "  It is ordered into the initrd, not enabled from a .wants directory; an" >&2
+    echo "  [Install] invites exactly the host-side placement that no longer works." >&2
+    exit 1
+fi
+# Reseal is the recovery path for a PCR 7 move; assert its load-bearing lines.
+reseal_u="$dest/usr/lib/systemd/system/vngrd-reseal.service"
+[ -f "$reseal_u" ] || {
+    echo "$0: vngrd-reseal.service is missing." >&2
+    echo "  Without it a PCR 7 change leaves the recovery passphrase as the only" >&2
+    echo "  way in on every boot, forever." >&2
+    exit 1
+}
+grep -q '^ConditionPathExists=/sysroot/var/lib/vngrd/reseal-requested$' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service is not gated on the reseal-requested marker." >&2
+    echo "  Resealing on every TPM failure would replace a working token on a" >&2
+    echo "  transient error; the operator has to ask for it." >&2
+    exit 1
+}
+grep -q '^ExecStart=/usr/lib/vngrd/vngrd-passphrase --current -- /usr/bin/systemd-cryptenroll ' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service does not unlock through the recovery passphrase." >&2
+    echo "  --unlock-tpm2-device=auto would re-use the token that just failed." >&2
+    exit 1
+}
+grep -q '^Before=vngrd-leave-initrd.service initrd-switch-root.service initrd-switch-root.target$' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service is not before the PCR 11 leave-initrd measurement." >&2
+    echo "  The new PolicyAuthorize names enter-initrd; after leave-initrd it can" >&2
+    echo "  never be satisfied again." >&2
+    exit 1
+}
+grep -q -- '--wipe-slot=tpm2' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service does not replace the old TPM2 token." >&2
+    echo "  Re-enrolling next to a token that no longer satisfies PCR 7 leaves" >&2
+    echo "  the broken token in place as a misleading second keyslot." >&2
+    exit 1
+}
+grep -q -- '--tpm2-pcrs=7' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service does not bind the new token to PCR 7." >&2
+    exit 1
+}
+grep -q -- '--tpm2-public-key-pcrs=11' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service does not keep the PCR 11 PolicyAuthorize." >&2
+    exit 1
+}
+grep -q -- '--tpm2-with-pin=yes' "$reseal_u" || {
+    echo "$0: vngrd-reseal.service would replace a PIN token with a PIN-less one." >&2
+    exit 1
+}
+if grep -qE '^\[Install\]' "$reseal_u"; then
+    echo "$0: vngrd-reseal.service must have no [Install] section." >&2
+    echo "  It is an initrd unit pulled in by initrd-root-fs.target.wants." >&2
+    exit 1
+fi
+
+# The old host units would enrol after the seal can no longer open; delete them.
+for gone in vngrd-recovery-key.service vngrd-recovery-key-reminder.service; do
+    if [ -e "$dest/usr/lib/systemd/system/$gone" ]; then
+        echo "$0: $gone still exists and must be deleted." >&2
+        echo "  It is a host unit; with PCR 11 phase-bound its --unlock-tpm2-device" >&2
+        echo "  cannot open the volume, and it would leave the user holding a" >&2
+        echo "  second secret for a machine whose passphrase is the real one." >&2
+        exit 1
+    fi
+done
+
+# PIN and pcrlock units fail silently: without them the token stays PIN-less or
+# the machine stays on the bare boot-1 seal.
+for u in vngrd-tpm-pin.service vngrd-tpm-pcrlock.service; do
+    [ -f "$dest/usr/lib/systemd/system/$u" ] || {
+        echo "$0: usr/lib/systemd/system/$u is missing." >&2
+        exit 1
+    }
+    if grep -qE '^\[Install\]' "$dest/usr/lib/systemd/system/$u"; then
+        echo "$0: $u must have no [Install] section; each is pulled in by a .wants" >&2
+        echo "  symlink from a target that only exists where that unit belongs." >&2
+        exit 1
+    fi
+done
+# Both are initrd units, enabled from initrd-root-fs.target.
+for l in initrd-root-fs.target.wants/vngrd-tpm-pin.service \
+         initrd-root-fs.target.wants/vngrd-tpm-pcrlock.service; do
+    g="usr/lib/systemd/system/$l"
+    [ -L "$dest/$g" ] || { echo "$0: $g must be a symlink" >&2; exit 1; }
+    case "$(readlink "$dest/$g")" in
+        /*) echo "$0: $g must be relative, not $(readlink "$dest/$g")" >&2; exit 1 ;;
+    esac
+    [ -e "$dest/$g" ] || { echo "$0: $g dangles" >&2; exit 1; }
+done
+# The PIN unit replaces the only non-passphrase keyslot; both marker halves are
+# asserted by name.
+grep -q 'touch /sysroot/var/lib/vngrd/recovery-key-enrolled' \
+    "$dest/usr/lib/systemd/system/vngrd-provision.service" || {
+    echo "$0: vngrd-provision.service no longer writes the recovery-key-enrolled marker." >&2
+    exit 1
+}
+grep -q '^ConditionPathExists=/sysroot/var/lib/vngrd/recovery-key-enrolled$' \
+    "$dest/usr/lib/systemd/system/vngrd-tpm-pin.service" || {
+    echo "$0: vngrd-tpm-pin.service no longer gates on the recovery-key-enrolled marker." >&2
+    echo "  It would then wipe the only non-passphrase keyslot on a machine whose" >&2
+    echo "  recovery passphrase was never enrolled." >&2
+    exit 1
+}
+# Enrolment must build the policy in /sysroot/var via --policy=; the initrd's
+# /var does not survive switch_root. Do not run the lock-* commands here: their
+# definitions die with the initrd and the next initrd cannot reproduce them.
+for bad in lock-firmware-code lock-firmware-config lock-secureboot-policy lock-secureboot-authority; do
+    grep -q "^ExecStartPre=/usr/lib/systemd/systemd-pcrlock $bad$" \
+        "$dest/usr/lib/systemd/system/vngrd-tpm-pcrlock.service" || {
+        echo "$0: the enrollment no longer runs $bad." >&2
+        echo "  Without it the component and the prediction are computed from" >&2
+        echo "  different points in the boot, the PCR goes unrecognized, and the" >&2
+        echo "  policy silently loses that PCR." >&2
+        exit 1
+    }
+done
+# These would write into the initrd's /var or claim a PCR no component covers.
+for bad in lock-gpt lock-file-system lock-machine-id lock-uki lock-pe; do
+    if grep -q "systemd-pcrlock $bad" "$dest/usr/lib/systemd/system/vngrd-tpm-pcrlock.service"; then
+        echo "$0: $bad is in the enrollment and must not be." >&2
+        echo "  It writes to the initrd's /var/lib/pcrlock.d, which dies at" >&2
+        echo "  switch_root, so its component is invisible to every later initrd" >&2
+        echo "  while the host's refresh still writes it into the policy." >&2
+        exit 1
+    fi
+done
+# Pin the component search to the shipped tree so the next initrd reproduces it.
+grep -q '^ExecStartPre=/usr/lib/systemd/systemd-pcrlock --components=/var/lib/pcrlock.d --components=/sysusr/usr/lib/pcrlock.d --pcr=7,13,14 --location=850-sysinit make-policy --policy=/sysroot/var/lib/systemd/pcrlock.json$' \
+    "$dest/usr/lib/systemd/system/vngrd-tpm-pcrlock.service" || {
+    echo "$0: the enrollment no longer pins --components=/sysusr/usr/lib/pcrlock.d." >&2
+    echo "  The initrd has no /usr/lib/pcrlock.d (lib/initrd.sh seeds from an" >&2
+    echo "  allow list that never included it, and its assertion forbids it), so" >&2
+    echo "  a bare /usr/lib/pcrlock.d loads nothing at all: no components, every" >&2
+    echo "  record unrecognized, and the policy comes out as PCR 15 alone -- the" >&2
+    echo "  shape that boots and can never be refreshed. The verified /usr is" >&2
+    echo "  already mounted at /sysusr/usr when this unit runs." >&2
+    exit 1
+}
+# The pcrlock unit signals its attempt on failure; the PIN unit is the fallback.
+grep -q '^ExecStopPost=/usr/bin/touch /sysroot/var/lib/vngrd/pcrlock-attempted$' \
+    "$dest/usr/lib/systemd/system/vngrd-tpm-pcrlock.service" || {
+    echo "$0: vngrd-tpm-pcrlock.service no longer marks the attempt on failure." >&2
+    echo "  A pcrlock failure would then leave the machine PIN-less." >&2
+    exit 1
+}
+grep -q '^ConditionPathExists=/sysroot/var/lib/vngrd/pcrlock-attempted$' \
+    "$dest/usr/lib/systemd/system/vngrd-tpm-pin.service" || {
+    echo "$0: vngrd-tpm-pin.service is no longer the fallback." >&2
+    exit 1
+}
+# The host pushes the policy to the ESP as a TPM-sealed credential because the
+# next initrd needs it before /var is available.
+for l in sysinit.target.wants/vngrd-pcrlock-esp.service; do
+    g="usr/lib/systemd/system/$l"
+    [ -L "$dest/$g" ] || { echo "$0: $g must be a symlink" >&2; exit 1; }
+    [ -e "$dest/$g" ] || { echo "$0: $g dangles" >&2; exit 1; }
+done
+grep -q '^ExecStart=/usr/bin/systemd-creds encrypt --name=pcrlock\.%m --with-key=tpm2 --tpm2-pcrs=7 ' \
+    "$dest/usr/lib/systemd/system/vngrd-pcrlock-esp.service" || {
+    echo "$0: vngrd-pcrlock-esp.service no longer encrypts the policy to the ESP." >&2
+    echo "  Without it later initrds find no pcrlock credential at all -- the" >&2
+    echo "  unlock log was 'Failed to find TPM2 pcrlock policy file pcrlock.json'" >&2
+    echo "  followed by 'No encrypted system credentials passed', and the root" >&2
+    echo "  can never be opened again without the recovery passphrase." >&2
+    exit 1
+}
+# --with-key=tpm2, not null: the SRK/NV handle match is not authenticity, since
+# both handles are readable from the LUKS2 header. tpm2 seals to this machine's
+# SRK without PCRs; PCR 7 is bound separately below. systemd/build refuses
+# null-key credentials, and the boot test plants a forged one.
+grep -q ' --tpm2-pcrs=7 ' "$dest/usr/lib/systemd/system/vngrd-pcrlock-esp.service" || {
+    echo "$0: vngrd-pcrlock-esp.service must bind the credential to PCR 7 too." >&2
+    echo "  The SRK seal answers 'this machine', not 'this Secure Boot policy':" >&2
+    echo "  with db reloaded the SRK is unchanged, the SRK/NV handle match still" >&2
+    echo "  passes, and the credential decrypts under the attacker's policy." >&2
+    exit 1
+}
+case " $(grep -h '^ExecStart=/usr/bin/systemd-creds encrypt' \
+        "$dest/usr/lib/systemd/system/vngrd-pcrlock-esp.service")" in
+    *" --with-key=null "*|*" --with-key=auto "*|*" --with-key=auto-initrd "*)
+        echo "$0: vngrd-pcrlock-esp.service must seal the policy with --with-key=tpm2." >&2
+        echo "  The SRK/NV handle match the consumer performs is not an authenticity" >&2
+        echo "  check: both handles are in the LUKS2 header, which is world-readable," >&2
+        echo "  so a substituted policy that copies them is accepted. Only the TPM" >&2
+        echo "  seal makes the credential this machine's." >&2
+        exit 1 ;;
+esac
+# The decrypt-verify round trip turns a torn ESP write into a failed unit now.
+grep -q '^ExecStartPost=/usr/bin/systemd-creds decrypt /efi/loader/credentials/pcrlock\.%m\.cred ' \
+    "$dest/usr/lib/systemd/system/vngrd-pcrlock-esp.service" || {
+    echo "$0: vngrd-pcrlock-esp.service does not decrypt-verify the credential it wrote." >&2
+    exit 1
+}
+grep -q '^ExecStartPost=/usr/bin/cmp -s /run/vngrd-pcrlock-verify ' \
+    "$dest/usr/lib/systemd/system/vngrd-pcrlock-esp.service" || {
+    echo "$0: vngrd-pcrlock-esp.service does not compare the decrypted credential." >&2
+    exit 1
+}
+# systemd-stub only scans .cred under loader/credentials.
+grep -q '/efi/loader/credentials/pcrlock\.%m\.cred$' \
+    "$dest/usr/lib/systemd/system/vngrd-pcrlock-esp.service" || {
+    echo "$0: vngrd-pcrlock-esp.service no longer writes /efi/loader/credentials/*.cred." >&2
+    echo "  systemd-stub only picks up .cred files under the ESP's" >&2
+    echo "  \\loader\\credentials, and cryptsetup only scans for the" >&2
+    echo "  'pcrlock.' prefix there. A path anywhere else is a credential" >&2
+    echo "  nothing will ever read." >&2
+    exit 1
+}
+ # The host refresh units are enabled upstream and must stay so. machine-id and
+ # file-system are not: they claim PCR 15, which the host measures after the root
+ # is open, while the initrd unseals with PCR 15 zero. The initrd still locks
+ # file-system into its own tmpfs; the host must not.
+rm -f "$dest/usr/lib/systemd/system/sysinit.target.wants/systemd-pcrlock-machine-id.service"
+rm -f "$dest/usr/lib/systemd/system/sysinit.target.wants/vngrd-pcrlock-gpt.service"
+rm -f "$dest/usr/lib/systemd/system/sysinit.target.wants/systemd-pcrlock-file-system.service"
+for u in machine-id file-system; do
+    g="usr/lib/systemd/system/sysinit.target.wants/systemd-pcrlock-$u.service"
+    if [ -L "$dest/$g" ]; then
+        echo "$0: $g is enabled, and it must not be." >&2
+        echo "  The component it locks claims PCR 15. The host measures PCR 15" >&2
+        echo "  (systemd-pcrmachine.service, after the volume is open), so the" >&2
+        echo "  definition would be found, the host's policy would bind PCR 15, and" >&2
+        echo "  the initrd -- which unseals with PCR 15 still zero -- could never" >&2
+        echo "  open the volume again." >&2
+        exit 1
+    fi
+done
+for u in firmware-code firmware-config secureboot-policy secureboot-authority; do
+    g="usr/lib/systemd/system/sysinit.target.wants/systemd-pcrlock-$u.service"
+    [ -L "$dest/$g" ] || { echo "$0: $g must be a symlink" >&2; exit 1; }
+    [ -e "$dest/$g" ] || { echo "$0: $g dangles" >&2; exit 1; }
+done
+# vngrd-pcrlock-gpt and the host GPT lock are removed: the definition was
+# invisible to the initrd and PCR 5 is not in the policy.
+#
+# The refresh is pinned to --location=850-sysinit. The old 760 window dropped the
+# firmware components, leaving only PCR 15; the host then measured machine-id there
+# and the NV write failed with TPM2_RC_PCR_CHANGED. With one window both runs agree
+# at provisioning, and later differences are writes the old policy can authorise.
+# A dbx update or key rotation that moves a pinned PCR still needs recovery or
+# unlock-secureboot-policy before the change.
+for g in "usr/lib/systemd/system/sysinit.target.wants/systemd-pcrlock-make-policy.service" \
+         "usr/lib/systemd/system/systemd-pcrlock-make-policy.service.d/10-vngrd.conf" \
+         "usr/lib/systemd/system/systemd-pcrlock@.service.d/10-vngrd.conf" \
+         "usr/lib/systemd/system/systemd-sysupdate-notify-pcrlock@.service.d/10-vngrd.conf"; do
+    [ -f "$dest/$g" ] || { echo "$0: $g is missing." >&2; exit 1; }
+done
+# Assert the window in all three paths: boot unit, varlink server, sysupdate
+# notify. One wrong window makes the policy depend on which path ran first.
+for g in "usr/lib/systemd/system/systemd-pcrlock-make-policy.service.d/10-vngrd.conf" \
+         "usr/lib/systemd/system/systemd-pcrlock@.service.d/10-vngrd.conf" \
+         "usr/lib/systemd/system/systemd-sysupdate-notify-pcrlock@.service.d/10-vngrd.conf"; do
+    grep -q '^ExecStart=/usr/lib/systemd/systemd-pcrlock --components=/var/lib/pcrlock.d --components=/usr/lib/pcrlock.d --pcr=7,13,14 --location=850-sysinit' "$dest/$g" || {
+        echo "$0: $g is not pinned to --components=/usr/lib/pcrlock.d --location=850-sysinit." >&2
+        echo "  Upstream's window is 770, which skips 770-nvpcr-separator and drops" >&2
+        echo "  PCR 9; and without --components= the host's run computes a policy" >&2
+        echo "  from /var/lib/pcrlock.d definitions the initrd cannot have, which" >&2
+        echo "  is the shape that failed Esys_PolicyOR on the second boot." >&2
+        exit 1
+    }
+done
+# Host token re-enrolment cannot work while the root is active; pcrlock replaced
+# it. Assert the unit and script stay deleted.
+if [ -e "$dest/usr/lib/systemd/system/vngrd-tpm-heal.service" ]; then
+    echo "$0: vngrd-tpm-heal.service must be deleted (pcrlock replaced it)." >&2
+    exit 1
+fi
+if [ -e "$dest/usr/lib/vngrd/tpm-heal.fish" ]; then
+    echo "$0: usr/lib/vngrd/tpm-heal.fish must be deleted (pcrlock replaced it)." >&2
+    exit 1
+fi
+# boot-complete.target is systemd's, so this link dangles in the source tree and
+# resolves only in DESTDIR; checking it here is stronger, not weaker.
+for l in default.target.wants/boot-complete.target; do
+    g="usr/lib/systemd/system/$l"
+    [ -L "$dest/$g" ] || { echo "$0: $g must be a symlink" >&2; exit 1; }
+    case "$(readlink "$dest/$g")" in
+        /*) echo "$0: $g must be relative, not $(readlink "$dest/$g")" >&2; exit 1 ;;
+    esac
+    [ -e "$dest/$g" ] || { echo "$0: $g dangles in DESTDIR (is systemd's boot-complete.target installed?)" >&2; exit 1; }
+done
+[ -x "$dest/usr/lib/vngrd/boot-gate.fish" ] || {
+    echo "$0: usr/lib/vngrd/boot-gate.fish must be executable" >&2; exit 1; }
+# The old /etc-confine detector was inverted under tmpfs /etc. Remove stale
+# copies from cumulative out/; they would ship and fail on healthy machines.
+for stale in usr/lib/vngrd/etc-confine.fish \
+            usr/lib/systemd/system/vngrd-etc-confine.service; do
+    if [ -e "$dest/$stale" ]; then
+        echo "$0: removing stale $stale (the tmpfs /etc replaces the bind it" >&2
+        echo "  reported on; out/ is cumulative, so the last build left it)" >&2
+        rm -f "$dest/$stale"
+    fi
+done
+
+# Nothing may be enabled only through writable /etc/systemd/system. Everything
+# is at vendor precedence, so shadowing /etc is safe. Scan every symlink, not a
+# fixed list, and collect before exiting so no pipe hides the status.
+for l in $(find "$dest/usr/lib/systemd/system" -type l); do
+    case "$(readlink "$l")" in
+        /etc|/etc/*)
+            echo "$0: ${l#"$dest"/} points into /etc ($(readlink "$l"))" >&2
+            echo "  /etc is not verity-protected, and /etc/systemd/system outranks" >&2
+            echo "  /usr/lib/systemd/system in the unit search path, so this makes" >&2
+            echo "  the image's own enablement depend on a root-writable path." >&2
+            exit 1 ;;
+    esac
+done
+
+# This drop-in breaks the boot gate's ordering cycle. Without it PID 1 may delete
+# the gate's job and bless the slot unchecked. Assert content and that .d/ is a
+# directory, since a same-named file would replace systemd's unit.
+gdropin="$dest/usr/lib/systemd/system/boot-complete.target.d/10-vngrd.conf"
+[ -d "$dest/usr/lib/systemd/system/boot-complete.target.d" ] || {
+    echo "$0: boot-complete.target.d/ is missing: without it the boot gate's enablement" >&2
+    echo "  is part of an ordering cycle (see the drop-in's comment), and PID 1 breaks" >&2
+    echo "  that cycle by deleting a job -- sometimes vngrd-boot-gate.service's." >&2
+    exit 1; }
+# It must layer on systemd's unit, not replace it.
+if [ -e "$dest/usr/lib/systemd/system/boot-complete.target" ] && \
+   [ ! -e "$dest/usr/lib/systemd/system/boot-complete.target.requires" ]; then
+    echo "$0: boot-complete.target is a bare file with no .requires/ next to it." >&2
+    echo "  A same-named file in /usr/lib/systemd/system replaces the vendor unit" >&2
+    echo "  rather than merging with it; the fix belongs in boot-complete.target.d/." >&2
+    exit 1
+fi
+
+# Remove stale etc-confine enablements from cumulative out/ (dangling .wants).
+nconf=$(find "$dest/usr/lib/systemd/system" -name 'vngrd-etc-confine.service' | wc -l)
+if [ "$nconf" -ne 0 ]; then
+    echo "$0: removing $nconf stale vngrd-etc-confine.service enablement(s) from" >&2
+    echo "  out/ (cumulative; the unit and its enablement are both removed)" >&2
+    find "$dest/usr/lib/systemd/system" -name 'vngrd-etc-confine.service' -exec rm -f {} +
+fi
+
+for line in 'DefaultDependencies=no' 'Conflicts=shutdown.target' 'Before=shutdown.target'; do
+    grep -qxF "$line" "$gdropin" || {
+        echo "$0: $gdropin is missing '$line'" >&2
+        echo "  DefaultDependencies=no is what breaks the cycle; the other two are the" >&2
+        echo "  shutdown relations dropping it would otherwise take with it." >&2
+        exit 1; }
+done
+
+# A confext without its release marker is silently ignored. None ships today
+# (systemd 257.5 has no directory merge and -Dsysext=false), but adding one must
+# fail the build rather than vanish.
+for d in "$dest"/usr/lib/confexts/*/; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d")
+    [ -f "$d/etc/extension-release.d/extension-release.$n" ] || {
+        echo "$0: usr/lib/confexts/$n/etc/extension-release.d/extension-release.$n is missing" >&2
+        echo "  A confext with no release marker is silently ignored: no merge, no" >&2
+        echo "  error, no log. See src/basic/os-util.c open_extension_release_at()." >&2
+        exit 1; }
+done
+exit 0
+
+# The two components that are unsafe here must not be enabled, by name.
+for u in machine-id file-system; do
+    g="usr/lib/systemd/system/sysinit.target.wants/systemd-pcrlock-$u.service"
+    if [ -L "$dest/$g" ]; then
+        echo "$0: $g is enabled, and it must not be." >&2
+        echo "  It locks a component whose value can differ between the initrd and" >&2
+        echo "  the host (initrd machine ID, /var identity), so the policy can match" >&2
+        echo "  on one boot and not the next -- stranding the machine on the recovery passphrase." >&2
+        exit 1
+    fi
+done

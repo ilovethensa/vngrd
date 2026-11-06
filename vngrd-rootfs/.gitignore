@@ -1,0 +1,10 @@
+out/
+work/
+sources/
+bin/
+cache/
+.cache/
+*.tar.gz
+*.tar.xz
+dist/
+__pycache__/

@@ -1,0 +1,33 @@
+[Unit]
+# Close the PCR 11 key-availability window.
+#
+# The leave-initrd phase used to run in systemd-pcrphase-initrd.service's
+# ExecStop, where it could land while cryptenroll held a policy session over
+# PCR 11, making the TPM answer TPM2_RC_PCR_CHANGED and losing the passphrase
+# keyslot. Splitting it out makes the order explicit:
+#
+#     enter-initrd -> cryptsetup unlocks -> vngrd-provision enrols
+#                  -> leave-initrd (this unit) -> switch-root
+#
+# After= rather than Requires=: if provisioning fails, this unit still runs and
+# the window still closes. Leaving it open would be the one state in which the
+# volume key is releasable for the rest of the boot.
+#
+# systemd-pcrextend --graceful only tolerates an ABSENT TPM, not a broken one, so
+# FailureAction=reboot-force is what turns that into a visible boot failure.
+DefaultDependencies=no
+# Conflicts=shutdown.target rather than initrd-switch-root.target: the latter
+# reintroduces the stop-ordering race this unit exists to avoid.
+Conflicts=shutdown.target
+After=vngrd-provision.service
+Before=initrd-switch-root.target
+ConditionPathExists=/etc/initrd-release
+ConditionSecurity=measured-os
+FailureAction=reboot-force
+
+[Service]
+Type=oneshot
+# A step in the initrd that happens once; switch-root discards the namespace.
+RemainAfterExit=no
+# Same binary and phase name as upstream, so the PCR 11 value is identical.
+ExecStart=/usr/lib/systemd/systemd-pcrextend --graceful leave-initrd

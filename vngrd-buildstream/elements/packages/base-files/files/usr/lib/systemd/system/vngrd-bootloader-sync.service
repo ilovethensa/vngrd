@@ -1,0 +1,26 @@
+[Unit]
+# Keep the signed sd-boot on the ESP current with the verified /usr.
+#
+# Secure Boot authenticates the loader that runs, but an image update carries a
+# new signed systemd-bootx64.efi in /usr while the old copy stays on the ESP.
+# This unit copies only when the bytes differ, fsyncs, renames and reads the
+# result back. It does not fall back to the unsigned .efi: Secure Boot would
+# refuse it, and the failure would surface a reboot later.
+#
+# Fatal to boot-complete: a loader update that silently did not land must not
+# bless the slot.
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=!/etc/initrd-release
+After=local-fs.target
+# vngrd-pcrlock-esp.service mounts the same vfat read-write at /efi.
+After=vngrd-pcrlock-esp.service
+Before=boot-complete.target shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=60s
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/lib/vngrd/vngrd-bootloader-sync

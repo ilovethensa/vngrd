@@ -1,0 +1,18 @@
+#!/bin/sh -e
+# vngrd-tests — self-contained test runner. No third-party Python packages.
+#
+#   bin/vngrd-tests list
+#   bin/vngrd-tests run --tier unit image
+#   bin/vngrd-tests run --tier boot --case t8-luks2
+#
+# VNGRO_PYTHON selects the interpreter (default: python3 on PATH).
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHON=${VNGRO_PYTHON:-python3}
+
+command -v "$PYTHON" >/dev/null 2>&1 || {
+    echo "vngrd-tests: no $PYTHON on PATH; set VNGRO_PYTHON" >&2
+    exit 2
+}
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$PYTHON" -m harness "$@"

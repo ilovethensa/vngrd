@@ -1,0 +1,51 @@
+# Slot data partition: the /usr filesystem of the next version. The filename
+# vngrd_<version>_<partition-uuid>.usr.xz carries the target UUID: sysupdate
+# fixates it onto the written partition, and the new UKI's usrhash= resolves the
+# partition by a UUID derived from the verity root hash.
+#
+# The artifact is one whole partition image, byte-exact to the partition size:
+# systemd-import raw --offset neither truncates nor zero-fills, so a short payload
+# would leave stale bytes and dm-verity would fail at the next boot.
+[Transfer]
+# Never overwrite the slot we booted from. If IMAGE_VERSION is empty this expands
+# to "", and sysupdate drops the constraint with a warning rather than an error.
+# vngrd-sysupdate.service's ExecStartPre= catches that, but nothing ships running
+# that unit; today the guard is whoever invokes systemd-sysupdate by hand.
+ProtectVersion=%A
+# Refuse artifacts older than the booted slot. ProtectVersion only stops an
+# overwrite; on a factory image the newest-installed comparison is skipped
+# because the ESP UKI name does not match this file set's pattern, so an older
+# staged set would be accepted. MinVersion makes it UPDATE_OBSOLETE. It expands
+# from IMAGE_VERSION too and only works because packages/systemd/build patches
+# the unexpanded-value validation (upstream 257.5).
+MinVersion=%A
+
+[Source]
+# regular-file, not url-file: there is no update server, network stack, CA bundle
+# or GnuPG involved.
+#
+# There is no integrity check on this transfer because systemd offers none for
+# Type=regular-file: the digest gate is URL-only, and @h is parsed but never
+# compared here. Upstream 257.5 has no TransferChecksum= or URLFile= table entry.
+# Adding a detached GPG check would be worse: /etc/sysupdate.d is on the writable
+# root and /run/sysupdate.d is tmpfs, unwatched. The real chain is Secure Boot ->
+# usrhash= in the signed UKI -> dm-verity; a rogue /usr fails to boot. The risk
+# is a compromised signing key, which no check here would fix.
+Type=regular-file
+Path=/var/lib/vngrd/update/
+MatchPattern=vngrd_@v_@u.usr.xz
+
+[Target]
+Type=partition
+# auto resolves the whole disk through /usr's backing device, looking through
+# dm-verity; data and hash partitions must share the physical device.
+Path=auto
+# The GPT label is the version store. Installed versions match this pattern;
+# _empty marks free space and is the only kind written; the oldest unprotected
+# slot is relabelled _empty before recycling. Two slots are the hard minimum.
+MatchPattern=vngrd-usr_@v
+MatchPartitionType=usr
+# Clear the attribute bytes, then set read-only (what the live slot carries).
+# Clear-first also drops the no-auto bit a _empty label implies later.
+PartitionFlags=0
+ReadOnly=1

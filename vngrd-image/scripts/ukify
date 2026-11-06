@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+# Restrict the UKI's .pcrsig to the enter-initrd boot phase, then defer to the
+# real ukify.
+#
+# WHY THIS EXISTS. mkosi drives ukify for us (mkosi/__init__.py:1824-1829 passes
+# --pcr-private-key / --pcr-public-key / --pcr-certificate) and never passes
+# --phases. With --phases absent, ukify's phase_path_groups is empty (ukify:749),
+# so the systemd-measure invocation at ukify:828 gets no --phase argument at all,
+# and systemd-measure signs *every* known phase. It emits one cumulative entry
+# each for enter-initrd, enter-initrd:leave-initrd, ...:sysinit, and ...:ready
+# (the four entries this repo has been shipping).
+#
+# That second entry is the whole problem. The root's TPM2 policy is
+#
+#     PolicyAuthorize{ policyFile = tpm2-pcr-public-key.pem, key = PCR_SIGNING_PUBKEY }
+#     PolicyPCR{ pcrs = 5+7 }
+#
+# and PolicyAuthorize is a statement about *the current value of PCR 11*: the TPM
+# computes the policy digest for whatever PCR 11 is right now and the TPM checks
+# that this key signed it (tpm2_calculate_policy_authorize(), src/shared/
+# tpm2-util.c:4029-4203). The set of signed entries is therefore exactly the set
+# of PCR 11 values that release the volume key.
+#
+# systemd-pcrphase-initrd.service extends enter-initrd on ExecStart and
+# leave-initrd on ExecStop, so a boot walks PCR 11 through exactly the two values
+# that are *both* in the four-entry signature:
+#
+#     initrd, before the phase barrier   ->  stub_only                 (not signed)
+#     initrd, cryptsetup runs here       ->  stub_only|enter-initrd    (signed -> key released)
+#     host, after switch-root's ExecStop ->  ...|enter-initrd|leave-initrd (signed -> key RELEASED AGAIN)
+#
+# So shipping all four phases does not narrow anything. The root volume key stays
+# releasable for the entire boot and long after it, which is precisely the
+# property this design exists to remove. Signing one phase -- enter-initrd -- is
+# what makes the second of those two values unsigned, so the TPM refuses
+# everything after the initrd and the key is available in the initrd only.
+#
+# A wrapper, not a patch, and not a re-signing pass. The signature is still
+# produced by systemd-measure's own code, unchanged, on the same invocation the
+# unseal verifies against; nothing here does crypto or touches the PE image.
+#
+# WHY IT IS SAFE TO SIT IN FRONT OF ukify. mkosi resolves the binary with
+# find_binary("ukify"), which searches extra_search_paths (mkosi.conf [Build]
+# ExtraSearchPaths=) *before* the tools tree (run.py:463,473) and ro-binds each
+# of those directories into the sandbox it runs ukify in (config.py:2635). So
+# this file is found first and the real ukify is still reachable inside the
+# sandbox. mkosi invokes it as `python <this file> build ...`, which is why this
+# is Python and not a shell script.
+#
+# The real ukify is located by explicit candidate paths rather than by which(3):
+# this file is itself named "ukify" and is on the search path, so a PATH lookup
+# would find us. VUKIFY_REAL_UKIFY overrides the search for unusual layouts.
+
+import os
+import runpy
+import sys
+from pathlib import Path
+
+# The one phase that may release the volume key. See the module docstring.
+PHASE = "enter-initrd"
+
+SELF = Path(__file__).resolve()
+
+# Tools tree is mkosi.tools/usr/bin/ukify, i.e. sibling of this scripts/ dir.
+CANDIDATES = [
+    Path("../mkosi.tools/usr/bin/ukify"),
+    Path("../mkosi.tools/usr/local/bin/ukify"),
+    Path("/usr/lib/systemd/ukify"),
+    Path("/usr/bin/ukify"),
+]
+
+
+def real_ukify() -> Path:
+    override = os.environ.get("VUKIFY_REAL_UKIFY")
+    if override:
+        p = Path(override).resolve()
+        if not p.is_file():
+            sys.exit(f"ukify wrapper: VUKIFY_REAL_UKIFY={override} is not a file")
+        print(f"ukify wrapper: ukify = {p} (VUKIFY_REAL_UKIFY)", file=sys.stderr)
+        return p
+
+    for cand in CANDIDATES:
+        p = (SELF.parent / cand).resolve()
+        if p.is_file() and p != SELF:
+            # Say which one was used: a host-installed /usr/bin/ukify of a
+            # different version produces a .pcrsig shape that mkosi.postoutput
+            # refuses, and without this line the refuse message names no cause.
+            print(f"ukify wrapper: ukify = {p} (found via {cand})", file=sys.stderr)
+            return p
+
+    sys.exit(
+        "ukify wrapper: could not find the real ukify. Tried: "
+        + ", ".join(str(c) for c in CANDIDATES)
+        + " Set VUKIFY_REAL_UKIFY to override."
+    )
+
+
+def inject(argv: list[str]) -> list[str]:
+    """Return argv with --phases=enter-initrd added, unless already given.
+
+    Idempotent, and it refuses to guess: if something upstream has already asked
+    for a different phase set, that is a deliberate change to the trust policy
+    and this wrapper must not paper over it.
+    """
+    if any(a == f"--phases={PHASE}" or a == "--phases" for a in argv):
+        return argv
+
+    for a in argv:
+        if a.startswith("--phases=") and a != f"--phases={PHASE}":
+            sys.exit(
+                f"ukify wrapper: refusing to override an explicit {a!r}; this "
+                f"image must sign the {PHASE} phase only (see scripts/ukify)."
+            )
+
+    # argparse subparsers require options to follow the subcommand name.
+    try:
+        idx = argv.index("build") + 1
+    except ValueError:
+        idx = 1
+    return argv[:idx] + [f"--phases={PHASE}"] + argv[idx:]
+
+
+def main() -> None:
+    real = real_ukify()
+    sys.argv = [str(real)] + inject(sys.argv[1:])
+    runpy.run_path(str(real), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()

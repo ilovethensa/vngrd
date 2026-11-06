@@ -1,0 +1,13 @@
+# Binaries removed from the skeleton after the closure walk.
+#
+# usr/lib/systemd is seeded whole, so anything in it that the boot path does not
+# need has to be named here. One path per line; text after '#' is a comment.
+#
+# systemd-import and systemd-export are referenced by systemd-sysupdate
+# (50-usr.transfer runs `systemd-import raw') and by systemd-importd, but both
+# are host side: sysupdate only runs after switch_root, and importd's socket does
+# not exist in the initrd.
+usr/lib/systemd/systemd-pull
+usr/lib/systemd/systemd-journal-upload
+usr/lib/systemd/systemd-import
+usr/lib/systemd/systemd-export

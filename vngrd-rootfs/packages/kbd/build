@@ -1,0 +1,43 @@
+#!/bin/sh -e
+dest="$1"
+cd kbd-2.10.0
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --datadir=/usr/share \
+    --sysconfdir=/etc \
+    --disable-vlock
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# unicode_start / unicode_stop are console-setup helpers for switching a virtual
+# console to UTF-8. They are invoked by Debian's console-setup package, which
+# this image does not have, and they ship with #!/bin/sh, which verify.sh
+# rejects because a merged-/usr rootfs has no /bin/sh. There is no POSIX shell
+# to point them at instead -- /usr/bin/sh is fish. Nothing in the rootfs or the
+# initrd calls them, and systemd-vconsole-setup drives the console itself, so
+# they are dropped and asserted so a future kbd that adds another is caught here
+# rather than by verify.sh two packages later.
+for t in unicode_start unicode_stop; do
+    rm -f "$dest/usr/bin/$t"
+    if [ -e "$dest/usr/bin/$t" ]; then
+        echo "kbd: $t should have been pruned but is present" >&2
+        exit 1
+    fi
+done
+for t in loadkeys; do
+    if [ ! -e "$dest/usr/bin/$t" ]; then
+        echo "kbd: $t missing from the install" >&2
+        exit 1
+    fi
+done

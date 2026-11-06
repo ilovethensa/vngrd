@@ -1,0 +1,33 @@
+[Unit]
+# The fourth NV guard: refuse a provisioned machine whose fixate digest register
+# is absent.
+#
+# vngrd-fixate-generator adds fixate-volume-key= to cryptsetup's command line,
+# and cryptsetup checks it. But a generator cannot fail a boot, so when the
+# register is missing the generator succeeds and the volume opens with no
+# volume-key binding. This unit turns that state into a failure.
+#
+# An absent index passes only with the repart provisioning marker or with no
+# root partition. A TPM clear removes the index too, so it is the same
+# re-provisioning event as the rollback guard: the recovery passphrase opens the
+# volume, but it does not satisfy this check.
+#
+# After systemd-repart.service: repart writes the root partition before it appends
+# fixate-volume-key= to the crypttab, and a guard running between those moments
+# would mistake a healthy first boot for a deleted register.
+DefaultDependencies=no
+After=sysusr-usr.mount systemd-repart.service
+Before=sysroot.mount
+Before=systemd-cryptsetup@vngrd\x2droot.service
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+FailureAction=reboot-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell: /usr/bin/sh is fish and the initrd has none on this path.
+ExecStart=/usr/lib/vngrd/vngrd-fixate-guard

@@ -1,0 +1,12 @@
+[project]
+name = "vngrd-tests"
+version = "0.1.0"
+description = "Boot and security test suite for vngrd (self-contained, stdlib only)"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.vngrd-tests]
+# Tiers are directories under this repository root. `unit` and `image` need no
+# virtualisation and are expected to run on every build; `boot` needs qemu and
+# swtpm and runs on demand.
+tiers = ["unit", "image", "boot"]

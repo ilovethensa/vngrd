@@ -1,0 +1,63 @@
+#!/bin/sh -e
+dest="$1"
+cd xz-5.8.4
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --disable-static
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# The lz* helpers are shell wrappers around cmp/diff/egrep/fgrep/grep/less/more
+# that exist so a pipeline can be run from a shell. All seven ship with
+# #!/bin/sh, verify.sh rejects that (a merged-/usr rootfs has no /bin/sh), and
+# this image has no POSIX shell to point them at -- /usr/bin/sh is fish, and the
+# initrd has no shell at all. Nothing in the rootfs or the initrd calls them:
+# the only xz consumers are systemd-repart and the initrd's own seeding, and
+# both use the library or the single-binary tools. Dropped, and asserted, so a
+# future xz release that grows another wrapper is caught here rather than by
+# verify.sh three packages later.
+# Listed by pattern rather than by name: xz ships the same helpers under two
+# prefixes (lzgrep and xzgrep, lzmore and xzmore, ...) and enumerating them
+# meant a release that added one came back as a verify.sh failure.
+for t in lzcmp lzdiff lzegrep lzfgrep lzgrep lzless lzmore \
+         xzcmp xzdiff xzegrep xzfgrep xzgrep xzless xzmore; do
+    rm -f "$dest/usr/bin/$t"
+    if [ -e "$dest/usr/bin/$t" ]; then
+        echo "xz: $t should have been pruned but is present" >&2
+        exit 1
+    fi
+done
+for t in xz unxz xzcat lzmadec xzdec; do
+    if [ ! -e "$dest/usr/bin/$t" ]; then
+        echo "xz: $t missing from the install" >&2
+        exit 1
+    fi
+done
+
+# Belt and braces: whatever is left in /usr/bin with a #!/bin/* interpreter is a
+# shell wrapper and cannot run here. Remove it and say so, so a new one in a
+# future release is a logged line rather than a build failure two packages later.
+for f in "$dest"/usr/bin/*; do
+    [ -f "$f" ] || continue
+    case "$(head -c2 "$f" 2>/dev/null)" in
+        '#!')
+            case "$(sed -n '1p' "$f" 2>/dev/null)" in
+                '#!/bin/'*)
+                    echo "xz: removing shell wrapper $(basename "$f")" >&2
+                    rm -f "$f"
+                    ;;
+            esac
+            ;;
+    esac
+done

@@ -1,0 +1,38 @@
+#!/bin/sh -e
+dest="$1"
+cd zstd-1.5.7
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+make -j${JOBS:-$(nproc)} PREFIX=/usr
+make DESTDIR="$dest" PREFIX=/usr install
+
+# Ensure no top-level sbin
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin" 2>/dev/null || true
+fi
+
+# zstdgrep and zstdless are shell pipes around zgrep/zless for use from a shell.
+# They ship with #!/bin/sh, which verify.sh rejects because a merged-/usr
+# rootfs has no /bin/sh, and this image has no POSIX shell to point them at
+# instead -- /usr/bin/sh is fish. Nothing in the rootfs or the initrd invokes
+# them, so they are dropped rather than made into a lie about an interpreter
+# that is not there.
+rm -f "$dest/usr/bin/zstdgrep" "$dest/usr/bin/zstdless"
+for gone in zstdgrep zstdless; do
+    if [ -e "$dest/usr/bin/$gone" ]; then
+        echo "zstd: $gone should have been pruned but is present" >&2
+        exit 1
+    fi
+done
+for t in zstd zstdcat; do
+    if [ ! -e "$dest/usr/bin/$t" ]; then
+        echo "zstd: $t missing from the install" >&2
+        exit 1
+    fi
+done

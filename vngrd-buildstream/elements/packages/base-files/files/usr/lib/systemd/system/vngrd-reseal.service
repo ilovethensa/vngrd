@@ -1,0 +1,52 @@
+[Unit]
+# Re-seal the root's TPM2 token after a firmware or dbx update moved PCR 7.
+#
+# The token is bound to PCR 7 plus the PCR 11 phase signature and a PIN. A dbx
+# update, key enrolment or firmware update changes PCR 7, so the old token can
+# no longer unseal and the recovery passphrase is the only way in. The
+# passphrase opens the volume but does not update the token; without this unit
+# every later boot would ask for it forever.
+#
+# The trigger is a file on the unlocked root, so it cannot be used to force a
+# reseal before the passphrase is known:
+#     touch /var/lib/vngrd/reseal-requested && systemctl reboot
+#
+# It re-enrols a bare PCR 7 + PolicyAuthorize(PCR 11) token with a PIN, matching
+# vngrd-tpm-pin.service. It does not regenerate a pcrlock policy: reproducing a
+# changed firmware's component set during recovery is exactly when a reseal
+# must not fail. The pcrlock path can be re-run separately.
+#
+# The new token's PolicyAuthorize must be written while enter-initrd is the live
+# PCR 11 value, so this runs before leave-initrd and the switch-root service.
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+# A provisioned machine only: tpm-enrolled proves the first boot completed.
+ConditionPathExists=/sysroot/var/lib/vngrd/reseal-requested
+ConditionPathExists=/sysroot/var/lib/vngrd/tpm-enrolled
+After=sysroot.mount
+Requires=sysroot.mount
+Before=vngrd-leave-initrd.service initrd-switch-root.service initrd-switch-root.target
+# The ask-password agents are stopped at cryptsetup.target; this still prompts.
+Wants=systemd-ask-password-console.path
+After=systemd-ask-password-console.path
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+# The console is the only durable trace; the initrd journal is volatile.
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStartPre=/usr/bin/printf '\n*** vngrd: RE-SEALING the root TPM2 token. ***\n*** Enter the recovery passphrase once for the reseal, then choose the TPM2 PIN\n*** that will protect the new token. The passphrase is not changed. ***\n\n'
+# --current supplies PASSWORD so cryptenroll can unlock with the old token
+# broken. --wipe-slot=tpm2 replaces the token; --tpm2-with-pin=yes asks for the
+# new PIN twice and hashes it into the policy without storing it.
+ExecStart=/usr/lib/vngrd/vngrd-passphrase --current -- /usr/bin/systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11 --tpm2-with-pin=yes /dev/disk/by-partlabel/vngrd-root
+# Only after cryptenroll succeeded. On failure the marker stays so the next boot
+# retries; the boot can continue because the passphrase already opened the root.
+ExecStartPost=/usr/bin/rm -f /sysroot/var/lib/vngrd/reseal-requested
+ExecStartPost=/usr/bin/touch /sysroot/var/lib/vngrd/reseal-completed
+ExecStartPost=/usr/bin/printf '*** vngrd: reseal complete; the root token now names the current PCR 7.\n'
+# A human types two secrets; Argon2id under emulation is not fast.
+TimeoutStartSec=10min

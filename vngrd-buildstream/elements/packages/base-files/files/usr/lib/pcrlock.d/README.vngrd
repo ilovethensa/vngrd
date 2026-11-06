@@ -1,0 +1,130 @@
+This file is NOT a systemd-pcrlock component definition.
+
+systemd-pcrlock(8) reads *.pcrlock and *.pcrlock.d/*.pcrlock from here
+(man/systemd.pcrlock.xml). Nothing in this directory is one of those, and
+deliberately so: everything a pcrlock definition can say about *this* machine is
+per-machine or per-image, and a definition shipped in an image is fixed at build
+time. The variant directories next to this file -- 400-secureboot-separator,
+500-separator and 700-action-efi-exit-boot-services -- are systemd's, and they
+ship empty on purpose: the per-machine values are generated at provisioning time
+by the lock-* commands, which write into /var/lib/pcrlock.d (also searched, after
+this one; upstream's own default set of component directories is
+
+    /etc/pcrlock.d /run/pcrlock.d /var/lib/pcrlock.d
+    /usr/local/lib/pcrlock.d /usr/lib/pcrlock.d
+
+and later directories mask earlier ones only by filename, so the two compose).
+
+WHAT RUNS, AND WHERE
+
+  initrd, on the boot that provisions, before switch_root
+      vngrd-tpm-pcrlock.service
+        make-policy --components=/sysusr/usr/lib/pcrlock.d
+                      --location=850-sysinit -> /sysroot/var/lib/systemd/pcrlock.json
+      then systemd-cryptenroll --tpm2-pcrlock=... --tpm2-with-pin=yes
+
+  host, every boot
+      systemd-pcrlock-{firmware-code,firmware-config,secureboot-policy,
+      secureboot-authority}.service   (upstream units, enabled as shipped)
+      systemd-pcrlock-make-policy.service with
+        --components=/usr/lib/pcrlock.d --location=850-sysinit (drop-in)
+      systemd-pcrlock@.service and systemd-sysupdate-notify-pcrlock@.service,
+        same drop-in, same reason
+      vngrd-pcrlock-esp.service       re-writes the ESP copy every boot
+
+The four lock-* units above DO run on the host, and that is not an oversight:
+they keep /var/lib/pcrlock.d populated for the *host's* own use (systemd-pcrlock
+log, an operator running systemd-pcrlock predict by hand). What they must never
+do is reach the policy, which is why every make-policy path pins
+--components= to a /usr/lib/pcrlock.d tree and not the default set that includes
+/var/lib/pcrlock.d.
+
+The two --components= paths are deliberately different and name the same files:
+the initrd has no /usr/lib/pcrlock.d of its own (lib/initrd.sh seeds the initrd
+from an allow list that never included it, and its assertion even forbids it --
+so a bare /usr/lib/pcrlock.d in the enrollment loads NO components, silently,
+and the policy comes out as PCR 15 alone), so it reads the verified /usr that is
+already mounted at /sysusr/usr. The host's /usr/lib/pcrlock.d is that same tree
+mounted over /. Same digests, so the two runs of make-policy agree.
+
+lock-gpt, lock-kernel-initrd, lock-kernel-cmdline, lock-file-system and
+lock-machine-id are not run anywhere. Their components land in a /var/lib/
+pcrlock.d that the initrd cannot read, so they could only ever change the shape
+of a policy no initrd can satisfy; see "WHAT THE POLICY COVERS" for the measured
+consequence on PCR 5, and the file-system/machine-id note for PCR 15.
+
+WHAT THE POLICY COVERS
+
+On a machine that has booted twice, the enrollment's window (everything up to and
+including 800-leave-initrd) requires these components to be present in the event
+log, and the ones with definitions then make their PCRs predictable:
+
+    PCR 0,1,2,3   firmware code and config        (lock-firmware-*)
+    PCR 7         Secure Boot policy + authority  (lock-secureboot-*)
+    PCR 13,14     the OS separator                (750-os-separator, shipped)
+
+That is the measured set on a machine that has booted three times, from
+`systemd-pcrlock --location=850-sysinit predict'. Each of those PCRs carries two
+predicted alternatives (the two branches the component combinations produce), so
+the policy is a set, not a single value -- which is what makes a firmware update
+that only changes the *variant* (a new db entry no longer duplicated, say)
+something the refresh can write.
+
+Dropped, and why, all three reasons enumerated by event_log_reduce_to_safe_pcrs():
+
+    PCR 4, 11, 12 the stub's own measurements into them have no component
+                  definition, so the log holds unrecognized records. This is
+                  also what keeps an A/B slot switch out of the policy: the
+                  loaded image and the per-slot usrhash= are in these PCRs, and
+                  they are exactly the PCRs nothing can predict.
+    PCR 15        machine-id / root file system identity are measured on the
+                  host, after the volume is open
+    PCR 5         the GPT record is recognized (lock-gpt) but systemd-stub
+                  also measures loader.conf into this PCR, and nothing maps
+                  that record -- so the partitioning is not asserted on this
+                  image, and lock-gpt is what makes it assertable. Measured:
+                  "Event log record 29 (PCR 5, "systemd-boot: loader.conf")
+                  not matching any component."
+    PCR 9         never in the mask at all: DEFAULT_PCR_MASK starts at 0 and
+                  skips 9, and the kernel's cmdline and initrd records live
+                  there. (Which is the safe outcome for lock-kernel-cmdline:
+                  see below.)
+
+PCR 5's drop has nothing to do with the ordering of lock-gpt. On the boot that
+provisions it drops *twice over* -- the GPT record in the log is the pre-repart
+table, which the post-repart definition does not match -- and on every boot after
+that it drops once, for the loader.conf record.
+
+WHAT IS NOT HERE AND WHY
+
+lock-machine-id: writes 820-machine-id.pcrlock, also PCR 15, and also into the
+initrd's tmpfs at enrollment. It would do the same job as lock-file-system, but
+the value it would name is the initrd's own randomly generated machine ID
+(/etc/machine-id is regenerated on every initrd boot because the root's is
+unreadable until the volume is open), so no policy could ever use it.
+
+lock-kernel-cmdline (710) and lock-kernel-initrd (720): both claim PCR 9, and PCR 9
+is where the kernel measures its own command line and initrd -- the measured log
+shows "Linux: kernel command line" and "Linux: initrd" in it. So the records
+exist, and a definition written from /proc/cmdline would map the first of them but
+not the initrd; lock-kernel-initrd would need the exact cpio the kernel loaded,
+which in a UKI is assembled by systemd-stub from several sections and is not a
+file anyone can name. Defining either one would satisfy the cmdline and leave the
+initrd unmapped, which changes nothing because the PCR is not in the default mask
+anyway. Neither is run, here or on the host, and the A/B cmdline (per-slot
+usrhash=) is the other reason not to: one variant per slot would be a list a
+host-side unit cannot maintain, and a sysupdate would have to update the policy.
+
+lock-uki / lock-pe: these need a path to the UKI and a --pcrlock= destination,
+and the number of allowed values is bounded (tpm2_policy_super_pcr() refuses a
+PCR with more than 8 predicted values). A policy over PCR 4 would have to name
+every UKI any slot can ever boot, which is a list no host-side unit can maintain,
+and it would make an A/B switch a policy change. PCR 4 is left unrecognized and
+therefore unbound, which is also what lets a sysupdate move the image without
+touching the root's seal.
+
+Read ../systemd/system/systemd-repart.service.d/10-device.conf for what the root
+volume is sealed to when there is no pcrlock policy yet -- on the boot that
+provisions, the volume is opened by repart's own
+PolicyAuthorize{PCR 11 signed} + PolicyPCR{7} token, and this enrollment is what
+replaces it for every later boot.

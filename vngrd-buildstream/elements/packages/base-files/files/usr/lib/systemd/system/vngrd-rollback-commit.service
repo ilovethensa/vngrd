@@ -1,0 +1,26 @@
+[Unit]
+# Raise the TPM rollback floor to this image's version once the boot reaches
+# boot-complete.
+#
+# The commit runs here, with systemd-bless-boot stripping the slot's boot
+# counter, so a version that boots but hangs never raises the floor past the
+# slot that still works. A version that reaches boot-complete has mounted its
+# root and come up, so raising the floor past it is safe.
+#
+# Enabled from boot-complete.target.requires/, not Wants=: a failed commit must
+# fail the target, or the slot is blessed with a floor that never moved.
+DefaultDependencies=no
+After=multi-user.target graphical.target default.target
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# A wedged TPM must not hold the boot. Normal boots are a no-op; adjacent
+# releases are ten counter steps apart.
+TimeoutStartSec=60s
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell. On the host /usr/lib/os-release is the verified tree.
+ExecStart=/usr/lib/vngrd/vngrd-rollback-commit /usr/lib/os-release

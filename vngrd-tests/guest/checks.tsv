@@ -1,0 +1,19 @@
+# Guest-side checks, run by vngrd-testreport and reported as `assert` events.
+#
+# Format: id <TAB> mode <TAB> expected <TAB> command
+#   eq      the command's stdout, trimmed, equals expected
+#   has     the command's stdout contains expected
+#   rc      the command's exit status equals expected
+#   absent  the path named by expected does not exist
+#
+# These are the properties that are decidable *in the guest* and are therefore
+# better checked here than by scraping prose from the host. Adding a check is
+# one line, not a new shell test case.
+
+etc-is-tmpfs	eq	tmpfs	findmnt -no FSTYPE /etc
+etc-nsswitch-present	rc	0	test -s /etc/nsswitch.conf
+lockdown-mode	eq	[integrity]	awk '{print $2}' /sys/kernel/security/lockdown
+host-pcrphase-sysinit-absent	rc	1	systemctl is-enabled systemd-pcrphase-sysinit.service
+host-pcrphase-ready-absent	rc	1	systemctl is-enabled systemd-pcrphase.service
+etc-confine-gone	absent	/usr/lib/systemd/system/vngrd-etc-confine.service
+gpt-measured-into-pcr5	has	EV_EFI_GPT_EVENT	tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurements

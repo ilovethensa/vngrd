@@ -1,0 +1,24 @@
+#!/bin/sh -e
+dest="$1"
+cd json-c-0.19
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=/usr/lib -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+cmake --build build -j${JOBS:-$(nproc)}
+DESTDIR="$dest" cmake --install build
+# Ensure pkgconfig is in /usr/lib/pkgconfig (not lib/x86_64-linux-gnu)
+if [ -d "$dest/usr/lib/x86_64-linux-gnu/pkgconfig" ]; then
+    mkdir -p "$dest/usr/lib/pkgconfig"
+    mv "$dest/usr/lib/x86_64-linux-gnu/pkgconfig"/*.pc "$dest/usr/lib/pkgconfig/" 2>/dev/null || true
+    rmdir "$dest/usr/lib/x86_64-linux-gnu/pkgconfig" 2>/dev/null || true
+    rmdir "$dest/usr/lib/x86_64-linux-gnu" 2>/dev/null || true
+fi
+if [ -f "$dest/usr/lib/x86_64-linux-gnu/libjson-c.so" ]; then
+    mv "$dest/usr/lib/x86_64-linux-gnu"/libjson-c.* "$dest/usr/lib/" 2>/dev/null || true
+    mv "$dest/usr/lib/x86_64-linux-gnu"/cmake "$dest/usr/lib/" 2>/dev/null || true
+    rmdir "$dest/usr/lib/x86_64-linux-gnu" 2>/dev/null || true
+fi

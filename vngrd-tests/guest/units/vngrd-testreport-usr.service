@@ -1,0 +1,16 @@
+[Unit]
+Description=vngrd initrd milestone: /usr mounted
+ConditionKernelCommandLine=vngrd.test=1
+DefaultDependencies=no
+After=initrd-usr-fs.target
+Before=initrd-root-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/vngrd-tests/vngrd-testreport event boot.usr-mounted
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=initrd-root-fs.target

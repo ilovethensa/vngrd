@@ -1,0 +1,30 @@
+# Verity tree for the /usr data partition written by 50-usr.transfer.
+#
+# Transferred, not recomputed: repart offers no salt key, derives the salt from a
+# per-invocation random seed, and nobody off the build host has that seed. So even
+# byte-identical /usr content produces a different root hash on every build.
+# mkosi passes one seed per run, which keeps the data and verity halves of a single
+# build consistent, but builds are not reproducible.
+#
+# The @u UUID keys this file to the data transfer. sysupdate writes all payloads
+# first, then applies labels/UUIDs/attributes in filename order, so the UKI lands
+# last and an interrupted update cannot leave a boot entry without partitions.
+#
+# No integrity check, for the reason in 50-usr.transfer.
+[Transfer]
+ProtectVersion=%A
+# Same downgrade floor as 50-usr.transfer: the two halves and the UKI are one set.
+MinVersion=%A
+
+[Source]
+Type=regular-file
+Path=/var/lib/vngrd/update/
+MatchPattern=vngrd_@v_@u.verity.xz
+
+[Target]
+Type=partition
+Path=auto
+MatchPattern=vngrd-usr_@v_verity
+MatchPartitionType=usr-verity
+PartitionFlags=0
+ReadOnly=1

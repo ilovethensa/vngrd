@@ -1,0 +1,36 @@
+[Unit]
+# Refuse a boot whose ESP contents are not the ones this machine was provisioned
+# with.
+#
+# Secure Boot, PCR 11 and dm-verity authenticate the UKI and /usr, but not the
+# FAT filesystem that holds sd-boot and loader.conf. Anyone who can mount it can
+# replace the loader or edit `default`/`timeout` while every other binding still
+# holds. PCR 4 measures the loader but moves with every update, so it is not in
+# the seal. Instead the ESP digest is frozen into TPM NV by vngrd-esp-freeze, and
+# recomputed here on every later boot.
+#
+# The guard mounts the ESP itself, read-only, nosuid, nodev, noexec, then
+# unmounts. A mount unit would leave an attacker-controlled filesystem standing.
+#
+# Fail-closed: no frozen digest means the machine is not provisioned, and the
+# boot passes. A digest that exists but cannot be re-checked is a refusal.
+#
+# After systemd-repart.service: repart writes the root partition before it appends
+# fixate-volume-key= to the crypttab, and a guard running between those moments
+# would mistake a healthy first boot for a deleted register.
+DefaultDependencies=no
+After=sysusr-usr.mount systemd-repart.service
+Before=sysroot.mount
+Before=systemd-cryptsetup@vngrd\x2droot.service
+Conflicts=shutdown.target
+ConditionPathExists=/etc/initrd-release
+FailureAction=reboot-force
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+# No shell: /usr/bin/sh is fish and the initrd has none on this path.
+ExecStart=/usr/lib/vngrd/vngrd-esp-guard

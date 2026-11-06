@@ -1,0 +1,60 @@
+#!/bin/sh -e
+
+dest="$1"
+cd util-linux-2.42.4
+
+# Fix sysroot interpreter for configure's run-test (needs host linker)
+# Our LDFLAGS sets --dynamic-linker=/usr/lib/ld-linux-x86-64.so.2 which is
+# /out/usr/lib/... inside sysroot but not on builder host (/lib/...).
+# Create host symlink so compiled test binaries can run.
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# Merged /usr: no /bin symlink, agetty defaults to /bin/login. Patch to /usr/bin/login (compile-time).
+sed -i 's|# define _PATH_LOGIN[[:space:]]*"/bin/login"|# define _PATH_LOGIN  "/usr/bin/login"|' include/pathnames.h 2>/dev/null || true
+grep -q '_PATH_LOGIN.*"/usr/bin/login"' include/pathnames.h || { echo "patch _PATH_LOGIN failed" >&2; exit 1; }
+
+# Minimal for systemd: only libs needed (libmount, libblkid, libuuid, libsmartcols)
+# Disable everything that would pull extra deps (python, systemd, tinfo/ncurses, pam)
+# Keep libcap support (found via pkg-config in sysroot)
+
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --runstatedir=/run \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --disable-rpath \
+    --disable-static \
+    --disable-chfn-chsh \
+    --enable-login \
+    --enable-nologin \
+    --enable-sulogin \
+    --disable-su \
+    --disable-setpriv \
+    --disable-runuser \
+    --disable-pylibmount \
+    --disable-liblastlog2 \
+    --disable-bash-completion \
+    --without-python \
+    --without-systemd \
+    --without-systemdsystemunitdir \
+    --without-tinfo \
+    --without-utempter \
+    --disable-asciidoc \
+    --disable-wall \
+    --disable-write
+
+# Merged /usr: util-linux hardcodes usrsbin_execdir=/usr/sbin (9 tools: addpart, uuidd…)
+# even though --sbindir=/usr/bin. Fix Makefile to install to /usr/bin (AGENTS.md).
+sed -i 's|^usrsbin_execdir =.*|usrsbin_execdir = /usr/bin|' Makefile
+sed -i 's|^usrbin_execdir =.*|usrbin_execdir = /usr/bin|' Makefile
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Trim large docs if any (keep man minimal) - don't fail if missing
+rm -rf "$dest/usr/share/doc" 2>/dev/null || true

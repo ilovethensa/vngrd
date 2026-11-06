@@ -1,0 +1,86 @@
+#!/bin/sh -e
+# util-linux's libraries, without its tools.
+#
+# The split breaks a cycle: cryptsetup needs libuuid, util-linux needs libudev.h
+# from systemd, and systemd needs libcryptsetup. The libraries never touch
+# libudev, so they can be built before systemd, turning the cycle into
+# util-linux-libs -> cryptsetup -> systemd -> util-linux.
+#
+# The install targets are discovered from the generated Makefile, so a renamed
+# target fails here rather than silently installing nothing.
+dest="$1"
+cd util-linux-2.42.4
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# util-linux has no --disable-programs. Restrict the pass by never running `make
+# all', only the library targets below. configure succeeds without libudev.h and
+# disables the programs that need it; the util-linux package later reconfigures
+# once systemd has installed the header.
+./configure \
+    --host="$HOST" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --sbindir=/usr/bin \
+    --bindir=/usr/bin \
+    --localstatedir=/var \
+    --runstatedir=/run \
+    --disable-nls \
+    --disable-static \
+    --disable-bash-completion \
+    --disable-pylibmount \
+    --disable-werror \
+    --enable-libuuid \
+    --enable-libblkid \
+    --enable-libmount \
+    --enable-libsmartcols
+
+# Only the libraries. libargparse has no installed target in 2.42.4.
+make -j${JOBS:-$(nproc)} libuuid.la libblkid.la libmount.la libsmartcols.la
+
+HDR_TARGETS=$(grep -oE '^install-[A-Za-z0-9_]+HEADERS:' Makefile | tr -d ':' | sort -u)
+LIB_TARGETS=$(grep -oE '^install-[A-Za-z0-9_]+LTLIBRARIES:' Makefile | tr -d ':' | sort -u)
+# .pc files are part of the contract: tpm2-tss and e2fsprogs probe libuuid via
+# pkg-config.
+PC_TARGET=$(grep -oE '^install-pkgconfigDATA:' Makefile | tr -d ':' | head -1)
+
+if [ -z "$HDR_TARGETS" ] || [ -z "$LIB_TARGETS" ]; then
+    echo "util-linux-libs: found no header or library install targets." >&2
+    echo "  expected install-*HEADERS (uuidinc_HEADERS) and install-*LTLIBRARIES" >&2
+    echo "  (usrlib_exec_LTLIBRARIES) in the generated Makefile." >&2
+    exit 1
+fi
+
+# shellcheck disable=SC2086
+make DESTDIR="$dest" $HDR_TARGETS
+# shellcheck disable=SC2086
+make DESTDIR="$dest" $LIB_TARGETS
+[ -n "$PC_TARGET" ] && make DESTDIR="$dest" "$PC_TARGET"
+
+# The contract with the two consumers: cryptsetup probes uuid/uuid.h and links
+# -luuid; e2fsprogs compiles lib/support/plausible.c against blkid/blkid.h.
+for f in usr/include/uuid/uuid.h usr/include/blkid/blkid.h; do
+    if [ ! -f "$dest/$f" ]; then
+        echo "util-linux-libs: $f missing from the install." >&2
+        echo "  cryptsetup will not configure without uuid/uuid.h." >&2
+        exit 1
+    fi
+done
+if [ ! -f "$dest/usr/lib/pkgconfig/uuid.pc" ]; then
+    echo "util-linux-libs: usr/lib/pkgconfig/uuid.pc missing." >&2
+    echo "  tpm2-tss and e2fsprogs configure against libuuid via pkg-config and" >&2
+    echo "  fail with 'You need the uuid library' without it." >&2
+    exit 1
+fi
+for l in libuuid.so libblkid.so; do
+    if [ ! -e "$dest/usr/lib/$l" ]; then
+        echo "util-linux-libs: $l missing from the install" >&2
+        exit 1
+    fi
+done
+
+# No "installed no programs" check: out/ is shared, so /usr/bin already holds
+# other packages' files. The before/after delta in verify.sh is the right tool.

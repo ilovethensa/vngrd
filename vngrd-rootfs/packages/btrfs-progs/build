@@ -1,0 +1,59 @@
+#!/bin/sh -e
+# btrfs-progs — mkfs.btrfs is the whole point: systemd-repart in the initrd
+# formats the root partition on first boot, and the initrd inherits this tree
+# (mkosi BaseTrees), so without mkfs.btrfs here the install image cannot create
+# a root at all.
+dest="$1"
+cd btrfs-progs-7.1
+
+if [ -f /out/usr/lib/ld-linux-x86-64.so.2 ] && [ ! -e /usr/lib/ld-linux-x86-64.so.2 ]; then
+    mkdir -p /usr/lib
+    ln -sf /out/usr/lib/ld-linux-x86-64.so.2 /usr/lib/ld-linux-x86-64.so.2
+fi
+
+# Merged /usr: btrfs-progs defaults to /sbin for the tools.
+# fsck.btrfs is a hand-written script with a hardcoded #!/bin/sh — fix at
+# source so the package is hermetic (AGENTS: no /bin, not even a symlink).
+sed -i '1s|^#!/bin/sh|#!/usr/bin/sh|' fsck.btrfs
+
+# The tag archive ships no generated configure, only autogen.sh.
+./autogen.sh
+
+# The Makefile reassigns LDFLAGS (= $(SUBST_LDFLAGS) -rdynamic ... $(EXTRA_LDFLAGS))
+# and hardcodes `EXTRA_LDFLAGS :=` empty, so the env LDFLAGS from
+# config/kiss.conf — which carries -Wl,--dynamic-linker=/usr/lib/ld-linux-x86-64.so.2
+# — is dropped. Without re-injecting it every binary ends up with the Debian
+# /lib64/ld-linux-x86-64.so.2 interpreter. Automake reads EXTRA_LDFLAGS from the
+# make command line, not from configure.
+./configure \
+    --prefix=/usr \
+    --sbindir=/usr/bin \
+    --libdir=/usr/lib \
+    --sysconfdir=/etc \
+    --localstatedir=/var \
+    --disable-static \
+    --enable-zstd \
+    --disable-lzo \
+    --disable-libudev \
+    --disable-python \
+    --disable-convert \
+    --disable-documentation
+
+make -j${JOBS:-$(nproc)} EXTRA_LDFLAGS="$LDFLAGS"
+make DESTDIR="$dest" install
+
+# Ensure no top-level sbin or lib (AGENTS: merged /usr only)
+if [ -d "$dest/sbin" ]; then
+    mkdir -p "$dest/usr/bin"
+    mv "$dest/sbin"/* "$dest/usr/bin/" 2>/dev/null || true
+    rmdir "$dest/sbin" 2>/dev/null || true
+fi
+if [ -d "$dest/lib" ]; then
+    mkdir -p "$dest/usr/lib"
+    mv "$dest/lib"/* "$dest/usr/lib/" 2>/dev/null || true
+    rmdir "$dest/lib" 2>/dev/null || true
+fi
+
+# The btrfs(8) subvolume helper is what mount(8) calls for -t btrfs; keep it
+# under /usr/lib/btrfs as upstream expects.
+[ -f "$dest/usr/bin/mount.btrfs" ] && chmod 0755 "$dest/usr/bin/mount.btrfs" 2>/dev/null || true

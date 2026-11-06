@@ -1,0 +1,15 @@
+#!/bin/sh -e
+dest="$1"
+cd zlib-ng-2.3.3
+
+# zlib-ng with compat provides drop-in zlib (libz.so, zlib.pc, zlib.h)
+./configure --zlib-compat --prefix=/usr --libdir=/usr/lib
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install
+
+# Ensure pkgconfig in expected sysroot path
+mkdir -p "$dest/usr/lib/pkgconfig"
+if [ ! -f "$dest/usr/lib/pkgconfig/zlib.pc" ] && [ -f "$dest/usr/share/pkgconfig/zlib.pc" ]; then
+    mv "$dest/usr/share/pkgconfig/zlib.pc" "$dest/usr/lib/pkgconfig/"
+fi

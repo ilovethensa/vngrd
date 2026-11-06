@@ -1,0 +1,15 @@
+#!/bin/sh -e
+dest="$1"
+cd expat-2.8.5
+
+./configure \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --includedir=/usr/include \
+    --host="$HOST" \
+    --without-docbook \
+    --without-tests \
+    --disable-static
+
+make -j${JOBS:-$(nproc)}
+make DESTDIR="$dest" install

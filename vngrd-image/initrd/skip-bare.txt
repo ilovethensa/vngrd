@@ -1,0 +1,19 @@
+# Bare names a unit execs that are deliberately absent from the initrd.
+#
+# Format: <name> then whitespace then a reason. Continuation lines are indented
+# and are part of the reason. The check matches the name at the start of a line,
+# so only the first field of each entry matters.
+#
+# A name here is a decision, not a silence: anything a unit references and that
+# is neither present nor listed here fails the build.
+plymouth            graphical splash; this image has no plymouth at all
+systemd-nspawn      container payloads; not a container host
+bootctl             operates on the ESP of the *running* system
+systemd-tty-ask-password-agent  only for encrypted credentials, which there are none of
+systemd-dissect                v262 unit the initrd does not need; see the bare-name scan note
+systemd-mute-console      socket-activated VT muting (systemd-mute-console.socket ->
+                           systemd-mute-console@.service). This is a serial-console
+                           appliance on one VT, and nothing in the initrd switches
+                           virtual terminals. v262 ships the socket where 257.5 did
+                           not, and the whole of usr/lib/systemd is seeded, so the
+                           bare-name scan started seeing it on the 262 upgrade.

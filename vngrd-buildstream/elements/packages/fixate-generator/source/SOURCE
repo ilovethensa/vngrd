@@ -1,0 +1,5 @@
+# Copied by scripts/export-fixate.sh from ../vngrd-fixate-generator.
+# Regenerate: ./scripts/export-fixate.sh
+source-repo: ../vngrd-fixate-generator
+source-rev: 44b9ece8734ca263452f4b1e05ac07ef128676be
+exported: 2026-11-03T07:58:11Z

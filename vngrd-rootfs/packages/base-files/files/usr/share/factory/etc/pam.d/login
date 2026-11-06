@@ -1,0 +1,8 @@
+#%PAM-1.0
+# Hermetic minimal - allow root without password, deny invalid users
+auth sufficient pam_succeed_if.so user = root
+auth include system-auth
+account sufficient pam_succeed_if.so user = root
+account include system-auth
+password include system-auth
+session include system-auth

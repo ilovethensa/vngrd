@@ -1,0 +1,22 @@
+[Unit]
+Description=vngrd structured self-test report
+Documentation=man:vngrd-tests(7)
+# Inert unless the boot asked for test instrumentation. The gate is a kernel
+# command line flag, which is part of the signed UKI, so it cannot be turned on
+# by anything that is not the image.
+ConditionKernelCommandLine=vngrd.test=1
+DefaultDependencies=no
+After=sysinit.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The checks file is data, not code: adding a property check is a line in
+# checks.tsv, not a new unit and not a new host-side test case.
+ExecStart=/usr/lib/vngrd-tests/vngrd-testreport checks /usr/share/vngrd/tests/checks.tsv
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
